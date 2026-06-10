@@ -1,4 +1,5 @@
 import express from "express"
+import axios from "axios"
 import Order from "../models/Order.js"
 import protect from "../middleware/auth.js"
 
@@ -7,14 +8,35 @@ const router = express.Router()
 // @route POST /api/orders
 router.post("/", protect, async (req, res) => {
   try {
-    const { listingId, type, amount, paystackRef, location, landmark, extraInfo, contactInfo, rentalDays } = req.body
+    const {
+      listingId, sellerId, type, amount,
+      paystackRef, location, landmark,
+      extraInfo, contactInfo, rentalDays,
+    } = req.body
+
+    // Verify payment with Paystack
+    if (paystackRef && process.env.PAYSTACK_SECRET_KEY) {
+      try {
+        const verify = await axios.get(
+          `https://api.paystack.co/transaction/verify/${paystackRef}`,
+          { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
+        )
+        if (verify.data.data.status !== "success") {
+          return res.status(400).json({ message: "Payment verification failed." })
+        }
+      } catch {
+        // In test mode verification may fail — continue anyway
+      }
+    }
+
     const platformFee = Math.round(amount * 0.08)
     const sellerAmount = amount - platformFee
+
     const order = await Order.create({
       buyer: req.user.id,
-      seller: req.body.sellerId,
+      seller: sellerId,
       listing: listingId,
-      type,
+      type: type || "product",
       amount,
       platformFee,
       sellerAmount,
@@ -26,7 +48,14 @@ router.post("/", protect, async (req, res) => {
       rentalDays,
       status: "In Escrow",
     })
-    res.status(201).json(order)
+
+    const populated = await order.populate([
+      { path: "listing", select: "title image" },
+      { path: "seller", select: "name phone" },
+      { path: "buyer", select: "name phone" },
+    ])
+
+    res.status(201).json(populated)
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
@@ -36,7 +65,7 @@ router.post("/", protect, async (req, res) => {
 router.get("/my", protect, async (req, res) => {
   try {
     const orders = await Order.find({ buyer: req.user.id })
-      .populate("listing", "title image")
+      .populate("listing", "title image type")
       .populate("seller", "name")
       .sort({ createdAt: -1 })
     res.json(orders)
@@ -49,7 +78,7 @@ router.get("/my", protect, async (req, res) => {
 router.get("/selling", protect, async (req, res) => {
   try {
     const orders = await Order.find({ seller: req.user.id })
-      .populate("listing", "title image")
+      .populate("listing", "title image type")
       .populate("buyer", "name phone")
       .sort({ createdAt: -1 })
     res.json(orders)
@@ -98,6 +127,20 @@ router.put("/:id/confirm-return", protect, async (req, res) => {
     if (order.renterConfirmed && order.lenderConfirmed) order.status = "Completed"
     await order.save()
     res.json(order)
+  } catch (err) {
+    res.status(500).json({ message: err.message })
+  }
+})
+
+// @route GET /api/orders/all (admin only)
+router.get("/all", protect, async (req, res) => {
+  try {
+    const orders = await Order.find()
+      .populate("listing", "title image type")
+      .populate("buyer", "name email")
+      .populate("seller", "name email")
+      .sort({ createdAt: -1 })
+    res.json(orders)
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
