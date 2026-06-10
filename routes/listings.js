@@ -8,12 +8,33 @@ const router = express.Router()
 // @route GET /api/listings
 router.get("/", async (req, res) => {
   try {
-    const { type, category, status } = req.query
+    const { type, category, status, page = 1, limit = 16, search } = req.query
     const filter = { status: status || "Active" }
     if (type) filter.type = type
     if (category) filter.category = category
+    if (search) {
+      filter.$or = [
+        { title: { $regex: search, $options: "i" } },
+        { desc: { $regex: search, $options: "i" } },
+        { category: { $regex: search, $options: "i" } },
+      ]
+    }
+    const skip = (Number(page) - 1) * Number(limit)
     const listings = await Listing.find(filter)
-      .populate("seller", "name university")
+      .populate("seller", "name university phone")
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(Number(limit))
+    res.json(listings)
+  } catch (err) {
+    res.status(500).json({ message: err.message })
+  }
+})
+
+// @route GET /api/listings/my
+router.get("/my", protect, async (req, res) => {
+  try {
+    const listings = await Listing.find({ seller: req.user.id })
       .sort({ createdAt: -1 })
     res.json(listings)
   } catch (err) {
@@ -24,7 +45,8 @@ router.get("/", async (req, res) => {
 // @route GET /api/listings/:id
 router.get("/:id", async (req, res) => {
   try {
-    const listing = await Listing.findById(req.params.id).populate("seller", "name university phone")
+    const listing = await Listing.findById(req.params.id)
+      .populate("seller", "name university phone")
     if (!listing) return res.status(404).json({ message: "Listing not found" })
     res.json(listing)
   } catch (err) {
@@ -42,7 +64,8 @@ router.post("/", protect, upload.single("image"), async (req, res) => {
       image: req.file.path,
       imagePublicId: req.file.filename,
     })
-    res.status(201).json(listing)
+    const populated = await listing.populate("seller", "name university")
+    res.status(201).json(populated)
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
