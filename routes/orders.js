@@ -14,7 +14,6 @@ router.post("/", protect, async (req, res) => {
       extraInfo, contactInfo, rentalDays,
     } = req.body
 
-    // Verify payment with Paystack
     if (paystackRef && process.env.PAYSTACK_SECRET_KEY) {
       try {
         const verify = await axios.get(
@@ -25,7 +24,7 @@ router.post("/", protect, async (req, res) => {
           return res.status(400).json({ message: "Payment verification failed." })
         }
       } catch {
-        // In test mode verification may fail — continue anyway
+        // test mode — continue anyway
       }
     }
 
@@ -87,6 +86,36 @@ router.get("/selling", protect, async (req, res) => {
   }
 })
 
+// @route GET /api/orders/all
+router.get("/all", protect, async (req, res) => {
+  try {
+    const orders = await Order.find()
+      .populate("listing", "title image type")
+      .populate("buyer", "name email")
+      .populate("seller", "name email")
+      .sort({ createdAt: -1 })
+    res.json(orders)
+  } catch (err) {
+    res.status(500).json({ message: err.message })
+  }
+})
+
+// @route PUT /api/orders/confirm-by-ref ← THE MISSING ROUTE
+router.put("/confirm-by-ref", protect, async (req, res) => {
+  try {
+    const { paystackRef } = req.body
+    if (!paystackRef) return res.status(400).json({ message: "Paystack reference required." })
+    const order = await Order.findOne({ paystackRef })
+    if (!order) return res.status(404).json({ message: "Order not found." })
+    if (order.buyer.toString() !== req.user.id) return res.status(403).json({ message: "Not authorized." })
+    order.status = "Completed"
+    await order.save()
+    res.json({ message: "Delivery confirmed. Payment released to seller.", order })
+  } catch (err) {
+    res.status(500).json({ message: err.message })
+  }
+})
+
 // @route PUT /api/orders/:id/confirm-delivery
 router.put("/:id/confirm-delivery", protect, async (req, res) => {
   try {
@@ -127,20 +156,6 @@ router.put("/:id/confirm-return", protect, async (req, res) => {
     if (order.renterConfirmed && order.lenderConfirmed) order.status = "Completed"
     await order.save()
     res.json(order)
-  } catch (err) {
-    res.status(500).json({ message: err.message })
-  }
-})
-
-// @route GET /api/orders/all (admin only)
-router.get("/all", protect, async (req, res) => {
-  try {
-    const orders = await Order.find()
-      .populate("listing", "title image type")
-      .populate("buyer", "name email")
-      .populate("seller", "name email")
-      .sort({ createdAt: -1 })
-    res.json(orders)
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
