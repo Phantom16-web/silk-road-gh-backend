@@ -12,6 +12,8 @@ import orderRoutes from "./routes/orders.js"
 import riderRoutes from "./routes/riders.js"
 import paymentRoutes from "./routes/payments.js"
 import adminRoutes from "./routes/admin.js"
+import promoRoutes from "./routes/promos.js"
+
 
 dotenv.config()
 
