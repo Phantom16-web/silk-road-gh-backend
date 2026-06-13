@@ -60,6 +60,8 @@ app.use("/api/orders", orderRoutes)
 app.use("/api/riders", riderRoutes)
 app.use("/api/payments", paymentRoutes)
 app.use("/api/admin", adminRoutes)
+app.use("/api/promos", promoRoutes)
+
 
 app.get("/", (req, res) => {
   res.send("🕸 Silk Road GH API is running")
