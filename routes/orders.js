@@ -1,22 +1,26 @@
 import express from "express"
-import axios from "axios"
 import Order from "../models/Order.js"
+import Listing from "../models/Listing.js"
 import protect from "../middleware/auth.js"
 
 const router = express.Router()
 
-// ── Helper: push real-time notification to seller ──────────────────────────────
+// ── Push real-time notification to seller on ALL connected devices ─────────────
 function pushToSeller(req, sellerId, notification) {
   try {
-    const io           = req.app.get("io")
+    const io            = req.app.get("io")
     const sellerSockets = req.app.get("sellerSockets")
     if (!io || !sellerSockets) return
-    const sockets = sellerSockets.get(String(sellerId))
-    if (!sockets || sockets.size === 0) return
+    const id = String(sellerId)
+    const sockets = sellerSockets.get(id)
+    if (!sockets || sockets.size === 0) {
+      console.log(`📭 Seller ${id} has no active sockets — notification stored only`)
+      return
+    }
     sockets.forEach(socketId => {
       io.to(socketId).emit("new_order_notification", notification)
     })
-    console.log(`📡 Pushed notification to seller ${sellerId} (${sockets.size} device(s))`)
+    console.log(`📡 Pushed to seller ${id} on ${sockets.size} device(s)`)
   } catch (err) {
     console.error("Socket push error:", err.message)
   }
@@ -26,38 +30,10 @@ function pushToSeller(req, sellerId, notification) {
 router.post("/", protect, async (req, res) => {
   try {
     const {
-      listingId, sellerId, type, amount,
-      paystackRef, location, landmark,
-      extraInfo, contactInfo, rentalDays,
-      promoCode, discount, deliveryMethod,
-      paymentMethod,
-    } = req.body
-
-    if (paystackRef && process.env.PAYSTACK_SECRET_KEY) {
-      try {
-        const verify = await axios.get(
-          `https://api.paystack.co/transaction/verify/${paystackRef}`,
-          { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
-        )
-        if (verify.data.data.status !== "success") {
-          return res.status(400).json({ message: "Payment verification failed." })
-        }
-      } catch {
-        // test mode — continue
-      }
-    }
-
-    const platformFee  = Math.round(amount * 0.08)
-    const sellerAmount = amount - platformFee
-
-    const order = await Order.create({
-      buyer: req.user.id,
-      seller: sellerId,
-      listing: listingId,
-      type: type || "product",
+      listingId,
+      sellerId,
+      type,
       amount,
-      platformFee,
-      sellerAmount,
       paystackRef,
       location,
       landmark,
@@ -68,7 +44,44 @@ router.post("/", protect, async (req, res) => {
       discount,
       deliveryMethod,
       paymentMethod,
-      status: "In Escrow",
+    } = req.body
+
+    // Resolve sellerId — if listingId provided and sellerId missing, look it up
+    let resolvedSellerId = sellerId
+    if (!resolvedSellerId && listingId) {
+      try {
+        const listing = await Listing.findById(listingId).select("seller")
+        if (listing) resolvedSellerId = listing.seller.toString()
+      } catch {}
+    }
+
+    // Guard: buyer cannot be their own seller
+    if (resolvedSellerId && resolvedSellerId.toString() === req.user.id) {
+      return res.status(400).json({ message: "You cannot order your own listing." })
+    }
+
+    const platformFee  = Math.round((amount || 0) * 0.08)
+    const sellerAmount = (amount || 0) - platformFee
+
+    const order = await Order.create({
+      buyer:          req.user.id,
+      seller:         resolvedSellerId || null,
+      listing:        listingId || null,
+      type:           type || "product",
+      amount:         amount || 0,
+      platformFee,
+      sellerAmount,
+      paystackRef:    paystackRef || null,
+      location:       location || null,
+      landmark:       landmark || null,
+      extraInfo:      extraInfo || null,
+      contactInfo:    contactInfo || null,
+      rentalDays:     rentalDays || null,
+      promoCode:      promoCode || null,
+      discount:       discount || 0,
+      deliveryMethod: deliveryMethod || "pickup",
+      paymentMethod:  paymentMethod || "manual_momo",
+      status:         "In Escrow",
     })
 
     const populated = await order.populate([
@@ -77,18 +90,20 @@ router.post("/", protect, async (req, res) => {
       { path: "buyer",   select: "name phone" },
     ])
 
-    // ── Push real-time notification to seller on ALL their devices ──────────────
-    if (sellerId) {
-      pushToSeller(req, sellerId, {
-        id:             `NOTIF-${Date.now()}`,
+    console.log(`✅ Order created: ${order._id} | buyer: ${req.user.id} | seller: ${resolvedSellerId}`)
+
+    // Push real-time notification to seller on all their devices
+    if (resolvedSellerId) {
+      pushToSeller(req, resolvedSellerId, {
+        id:             `NOTIF-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
         type:           "new_order",
         orderId:        order._id.toString(),
-        sellerId:       String(sellerId),
+        sellerId:       String(resolvedSellerId),
         itemTitle:      populated.listing?.title || "New Order",
         itemImage:      populated.listing?.image || null,
-        amount,
-        buyerContact:   contactInfo,
+        amount:         amount || 0,
         buyerName:      populated.buyer?.name || "A buyer",
+        buyerContact:   contactInfo || null,
         deliveryMethod: deliveryMethod || "pickup",
         location:       location || null,
         landmark:       landmark || null,
@@ -103,16 +118,17 @@ router.post("/", protect, async (req, res) => {
 
     res.status(201).json(populated)
   } catch (err) {
+    console.error("Order creation error:", err.message)
     res.status(500).json({ message: err.message })
   }
 })
 
-// @route GET /api/orders/my
+// @route GET /api/orders/my — buyer's orders
 router.get("/my", protect, async (req, res) => {
   try {
     const orders = await Order.find({ buyer: req.user.id })
       .populate("listing", "title image type")
-      .populate("seller", "name")
+      .populate("seller",  "name")
       .sort({ createdAt: -1 })
     res.json(orders)
   } catch (err) {
@@ -120,12 +136,12 @@ router.get("/my", protect, async (req, res) => {
   }
 })
 
-// @route GET /api/orders/selling
+// @route GET /api/orders/selling — seller's incoming orders
 router.get("/selling", protect, async (req, res) => {
   try {
     const orders = await Order.find({ seller: req.user.id })
       .populate("listing", "title image type")
-      .populate("buyer", "name phone")
+      .populate("buyer",   "name phone")
       .sort({ createdAt: -1 })
     res.json(orders)
   } catch (err) {
@@ -133,7 +149,7 @@ router.get("/selling", protect, async (req, res) => {
   }
 })
 
-// @route GET /api/orders/all
+// @route GET /api/orders/all — admin only
 router.get("/all", protect, async (req, res) => {
   try {
     const orders = await Order.find()
@@ -158,7 +174,7 @@ router.put("/confirm-by-ref", protect, async (req, res) => {
       return res.status(403).json({ message: "Not authorized." })
     order.status = "Completed"
     await order.save()
-    res.json({ message: "Delivery confirmed. Payment released to seller.", order })
+    res.json({ message: "Confirmed. Payment released to seller.", order })
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
@@ -173,7 +189,7 @@ router.put("/:id/confirm-delivery", protect, async (req, res) => {
       return res.status(403).json({ message: "Not authorized" })
     order.status = "Completed"
     await order.save()
-    res.json({ message: "Delivery confirmed.", order })
+    res.json({ message: "Confirmed.", order })
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
@@ -189,7 +205,7 @@ router.put("/:id/cancel", protect, async (req, res) => {
     order.status    = "Refunded"
     order.cancelled = true
     await order.save()
-    res.json({ message: "Order cancelled. Refund initiated.", order })
+    res.json({ message: "Cancelled. Refund initiated.", order })
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
