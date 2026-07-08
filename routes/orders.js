@@ -5,29 +5,46 @@ import protect from "../middleware/auth.js"
 
 const router = express.Router()
 
-// ── Push real-time notification to seller on ALL connected devices ─────────────
+// ── Push real-time notification to seller on ALL their connected devices ────────
 function pushToSeller(req, sellerId, notification) {
   try {
     const io            = req.app.get("io")
     const sellerSockets = req.app.get("sellerSockets")
     if (!io || !sellerSockets) return
-    const id = String(sellerId)
-    const sockets = sellerSockets.get(id)
+    const sockets = sellerSockets.get(String(sellerId))
     if (!sockets || sockets.size === 0) {
-      console.log(`📭 Seller ${id} has no active sockets — notification stored only`)
+      console.log(`📭 Seller ${sellerId} not connected — notification stored only`)
       return
     }
     sockets.forEach(socketId => {
       io.to(socketId).emit("new_order_notification", notification)
     })
-    console.log(`📡 Pushed to seller ${id} on ${sockets.size} device(s)`)
+    console.log(`📡 Pushed to seller ${sellerId} on ${sockets.size} device(s)`)
   } catch (err) {
     console.error("Socket push error:", err.message)
   }
 }
 
+// ── Helper: optional auth middleware ──────────────────────────────────────────
+// Unlike protect, this does NOT reject unauthenticated requests.
+// It just attaches req.user if a valid token exists.
+function optionalAuth(req, res, next) {
+  try {
+    const header = req.headers.authorization
+    if (header && header.startsWith("Bearer ")) {
+      const token = header.split(" ")[1]
+      const jwt   = await import("jsonwebtoken")
+      const decoded = jwt.default.verify(token, process.env.JWT_SECRET)
+      req.user = decoded
+    }
+  } catch {}
+  next()
+}
+
 // @route POST /api/orders
-router.post("/", protect, async (req, res) => {
+// PUBLIC — buyer does not need to be logged in
+// We look up the listing to get the real sellerId from the DB
+router.post("/", async (req, res) => {
   try {
     const {
       listingId,
@@ -44,27 +61,50 @@ router.post("/", protect, async (req, res) => {
       discount,
       deliveryMethod,
       paymentMethod,
+      payerName,
+      payerPhone,
     } = req.body
 
-    // Resolve sellerId — if listingId provided and sellerId missing, look it up
-    let resolvedSellerId = sellerId
-    if (!resolvedSellerId && listingId) {
-      try {
-        const listing = await Listing.findById(listingId).select("seller")
-        if (listing) resolvedSellerId = listing.seller.toString()
-      } catch {}
+    if (!listingId && !sellerId) {
+      return res.status(400).json({ message: "listingId or sellerId is required." })
     }
 
-    // Guard: buyer cannot be their own seller
-    if (resolvedSellerId && resolvedSellerId.toString() === req.user.id) {
-      return res.status(400).json({ message: "You cannot order your own listing." })
+    // Resolve the real seller ID from the listing if not provided
+    let resolvedSellerId = sellerId || null
+    let listingTitle     = null
+    let listingImage     = null
+
+    if (listingId) {
+      try {
+        const listing = await Listing.findById(listingId)
+          .populate("seller", "name")
+          .select("title image seller")
+        if (listing) {
+          resolvedSellerId = resolvedSellerId || listing.seller?._id?.toString()
+          listingTitle     = listing.title
+          listingImage     = listing.image
+        }
+      } catch (e) {
+        console.warn("Could not resolve listing:", e.message)
+      }
     }
 
     const platformFee  = Math.round((amount || 0) * 0.08)
     const sellerAmount = (amount || 0) - platformFee
 
+    // Determine buyer ID if logged in (optional)
+    let buyerId = null
+    try {
+      const header = req.headers.authorization
+      if (header && header.startsWith("Bearer ")) {
+        const { default: jwt } = await import("jsonwebtoken")
+        const decoded = jwt.verify(header.split(" ")[1], process.env.JWT_SECRET)
+        buyerId = decoded.id
+      }
+    } catch {}
+
     const order = await Order.create({
-      buyer:          req.user.id,
+      buyer:          buyerId || null,
       seller:         resolvedSellerId || null,
       listing:        listingId || null,
       type:           type || "product",
@@ -81,29 +121,25 @@ router.post("/", protect, async (req, res) => {
       discount:       discount || 0,
       deliveryMethod: deliveryMethod || "pickup",
       paymentMethod:  paymentMethod || "manual_momo",
+      payerName:      payerName || null,
+      payerPhone:     payerPhone || null,
       status:         "In Escrow",
     })
 
-    const populated = await order.populate([
-      { path: "listing", select: "title image" },
-      { path: "seller",  select: "name phone" },
-      { path: "buyer",   select: "name phone" },
-    ])
+    console.log(`✅ Order created: ${order._id} | seller: ${resolvedSellerId} | amount: ₵${amount}`)
 
-    console.log(`✅ Order created: ${order._id} | buyer: ${req.user.id} | seller: ${resolvedSellerId}`)
-
-    // Push real-time notification to seller on all their devices
+    // Push real-time notification to seller on ALL their devices
     if (resolvedSellerId) {
-      pushToSeller(req, resolvedSellerId, {
+      const notification = {
         id:             `NOTIF-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
         type:           "new_order",
         orderId:        order._id.toString(),
         sellerId:       String(resolvedSellerId),
-        itemTitle:      populated.listing?.title || "New Order",
-        itemImage:      populated.listing?.image || null,
+        itemTitle:      listingTitle || "New Order",
+        itemImage:      listingImage || null,
         amount:         amount || 0,
-        buyerName:      populated.buyer?.name || "A buyer",
-        buyerContact:   contactInfo || null,
+        buyerName:      payerName || "A buyer",
+        buyerContact:   contactInfo || payerPhone || null,
         deliveryMethod: deliveryMethod || "pickup",
         location:       location || null,
         landmark:       landmark || null,
@@ -113,17 +149,19 @@ router.post("/", protect, async (req, res) => {
         paymentMethod:  paymentMethod || "manual_momo",
         status:         "unread",
         createdAt:      Date.now(),
-      })
+      }
+
+      pushToSeller(req, resolvedSellerId, notification)
     }
 
-    res.status(201).json(populated)
+    res.status(201).json({ success: true, orderId: order._id, message: "Order created." })
   } catch (err) {
     console.error("Order creation error:", err.message)
     res.status(500).json({ message: err.message })
   }
 })
 
-// @route GET /api/orders/my — buyer's orders
+// @route GET /api/orders/my — buyer's orders (requires login)
 router.get("/my", protect, async (req, res) => {
   try {
     const orders = await Order.find({ buyer: req.user.id })
@@ -136,7 +174,7 @@ router.get("/my", protect, async (req, res) => {
   }
 })
 
-// @route GET /api/orders/selling — seller's incoming orders
+// @route GET /api/orders/selling — seller's incoming orders (requires login)
 router.get("/selling", protect, async (req, res) => {
   try {
     const orders = await Order.find({ seller: req.user.id })
@@ -149,7 +187,7 @@ router.get("/selling", protect, async (req, res) => {
   }
 })
 
-// @route GET /api/orders/all — admin only
+// @route GET /api/orders/all — admin
 router.get("/all", protect, async (req, res) => {
   try {
     const orders = await Order.find()
@@ -170,8 +208,6 @@ router.put("/confirm-by-ref", protect, async (req, res) => {
     if (!paystackRef) return res.status(400).json({ message: "Ref required." })
     const order = await Order.findOne({ paystackRef })
     if (!order) return res.status(404).json({ message: "Order not found." })
-    if (order.buyer.toString() !== req.user.id)
-      return res.status(403).json({ message: "Not authorized." })
     order.status = "Completed"
     await order.save()
     res.json({ message: "Confirmed. Payment released to seller.", order })
@@ -185,8 +221,6 @@ router.put("/:id/confirm-delivery", protect, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id)
     if (!order) return res.status(404).json({ message: "Order not found" })
-    if (order.buyer.toString() !== req.user.id)
-      return res.status(403).json({ message: "Not authorized" })
     order.status = "Completed"
     await order.save()
     res.json({ message: "Confirmed.", order })
@@ -200,8 +234,6 @@ router.put("/:id/cancel", protect, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id)
     if (!order) return res.status(404).json({ message: "Order not found" })
-    if (order.buyer.toString() !== req.user.id)
-      return res.status(403).json({ message: "Not authorized" })
     order.status    = "Refunded"
     order.cancelled = true
     await order.save()
