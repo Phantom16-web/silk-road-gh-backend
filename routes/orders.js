@@ -1,5 +1,6 @@
 import express from "express"
-import Order from "../models/Order.js"
+import jwt     from "jsonwebtoken"
+import Order   from "../models/Order.js"
 import Listing from "../models/Listing.js"
 import protect from "../middleware/auth.js"
 
@@ -25,25 +26,19 @@ function pushToSeller(req, sellerId, notification) {
   }
 }
 
-// ── Helper: optional auth middleware ──────────────────────────────────────────
-// Unlike protect, this does NOT reject unauthenticated requests.
-// It just attaches req.user if a valid token exists.
-function optionalAuth(req, res, next) {
+// ── Helper: get buyer ID from token if present (does NOT reject if missing) ────
+function getBuyerId(req) {
   try {
     const header = req.headers.authorization
     if (header && header.startsWith("Bearer ")) {
-      const token = header.split(" ")[1]
-      const jwt   = await import("jsonwebtoken")
-      const decoded = jwt.default.verify(token, process.env.JWT_SECRET)
-      req.user = decoded
+      const decoded = jwt.verify(header.split(" ")[1], process.env.JWT_SECRET)
+      return decoded.id || null
     }
   } catch {}
-  next()
+  return null
 }
 
-// @route POST /api/orders
-// PUBLIC — buyer does not need to be logged in
-// We look up the listing to get the real sellerId from the DB
+// @route POST /api/orders — PUBLIC, no auth required
 router.post("/", async (req, res) => {
   try {
     const {
@@ -69,7 +64,7 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "listingId or sellerId is required." })
     }
 
-    // Resolve the real seller ID from the listing if not provided
+    // Resolve seller ID and listing info from DB
     let resolvedSellerId = sellerId || null
     let listingTitle     = null
     let listingImage     = null
@@ -80,9 +75,9 @@ router.post("/", async (req, res) => {
           .populate("seller", "name")
           .select("title image seller")
         if (listing) {
-          resolvedSellerId = resolvedSellerId || listing.seller?._id?.toString()
-          listingTitle     = listing.title
-          listingImage     = listing.image
+          if (!resolvedSellerId) resolvedSellerId = listing.seller?._id?.toString()
+          listingTitle = listing.title
+          listingImage = listing.image
         }
       } catch (e) {
         console.warn("Could not resolve listing:", e.message)
@@ -92,16 +87,8 @@ router.post("/", async (req, res) => {
     const platformFee  = Math.round((amount || 0) * 0.08)
     const sellerAmount = (amount || 0) - platformFee
 
-    // Determine buyer ID if logged in (optional)
-    let buyerId = null
-    try {
-      const header = req.headers.authorization
-      if (header && header.startsWith("Bearer ")) {
-        const { default: jwt } = await import("jsonwebtoken")
-        const decoded = jwt.verify(header.split(" ")[1], process.env.JWT_SECRET)
-        buyerId = decoded.id
-      }
-    } catch {}
+    // Attach buyer ID if logged in (optional)
+    const buyerId = getBuyerId(req)
 
     const order = await Order.create({
       buyer:          buyerId || null,
@@ -126,11 +113,11 @@ router.post("/", async (req, res) => {
       status:         "In Escrow",
     })
 
-    console.log(`✅ Order created: ${order._id} | seller: ${resolvedSellerId} | amount: ₵${amount}`)
+    console.log(`✅ Order ${order._id} | seller: ${resolvedSellerId} | ₵${amount}`)
 
-    // Push real-time notification to seller on ALL their devices
+    // Fire socket push to seller on all their devices
     if (resolvedSellerId) {
-      const notification = {
+      pushToSeller(req, resolvedSellerId, {
         id:             `NOTIF-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
         type:           "new_order",
         orderId:        order._id.toString(),
@@ -149,9 +136,7 @@ router.post("/", async (req, res) => {
         paymentMethod:  paymentMethod || "manual_momo",
         status:         "unread",
         createdAt:      Date.now(),
-      }
-
-      pushToSeller(req, resolvedSellerId, notification)
+      })
     }
 
     res.status(201).json({ success: true, orderId: order._id, message: "Order created." })
@@ -161,7 +146,7 @@ router.post("/", async (req, res) => {
   }
 })
 
-// @route GET /api/orders/my — buyer's orders (requires login)
+// @route GET /api/orders/my
 router.get("/my", protect, async (req, res) => {
   try {
     const orders = await Order.find({ buyer: req.user.id })
@@ -174,7 +159,7 @@ router.get("/my", protect, async (req, res) => {
   }
 })
 
-// @route GET /api/orders/selling — seller's incoming orders (requires login)
+// @route GET /api/orders/selling
 router.get("/selling", protect, async (req, res) => {
   try {
     const orders = await Order.find({ seller: req.user.id })
@@ -187,7 +172,7 @@ router.get("/selling", protect, async (req, res) => {
   }
 })
 
-// @route GET /api/orders/all — admin
+// @route GET /api/orders/all
 router.get("/all", protect, async (req, res) => {
   try {
     const orders = await Order.find()
