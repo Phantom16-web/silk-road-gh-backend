@@ -1,7 +1,12 @@
 import mongoose from "mongoose"
 
 const orderSchema = new mongoose.Schema({
-  buyer: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+buyer: {
+  type: mongoose.Schema.Types.ObjectId,
+  ref: "User",
+  required: false,
+  default: null,
+},
   seller: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
   listing: { type: mongoose.Schema.Types.ObjectId, ref: "Listing", required: true },
   type: { type: String, enum: ["product", "rent", "service"], required: true },
