@@ -8,13 +8,14 @@ import mongoSanitize from "express-mongo-sanitize"
 import { createServer } from "http"
 import { Server }    from "socket.io"
 
-import authRoutes     from "./routes/auth.js"
-import listingRoutes  from "./routes/listings.js"
-import orderRoutes    from "./routes/orders.js"
-import riderRoutes    from "./routes/riders.js"
-import adminRoutes    from "./routes/admin.js"
-import settingsRoutes from "./routes/settings.js"
-import promoRoutes    from "./routes/promos.js"
+import authRoutes      from "./routes/auth.js"
+import listingRoutes   from "./routes/listings.js"
+import orderRoutes     from "./routes/orders.js"
+import adminRoutes     from "./routes/admin.js"
+import settingsRoutes  from "./routes/settings.js"
+import promoRoutes     from "./routes/promos.js"
+import riderAuthRoutes from "./routes/riderAuth.js"
+import deliveryRoutes  from "./routes/deliveries.js"
 
 dotenv.config()
 
@@ -29,27 +30,26 @@ const io = new Server(httpServer, {
       "https://silk-road-gh.vercel.app",
       /\.vercel\.app$/,
     ],
-    methods: ["GET", "POST"],
+    methods:     ["GET", "POST"],
     credentials: true,
   },
   pingTimeout:  60000,
   pingInterval: 25000,
 })
 
-// sellerId → Set of socket IDs
-// Every device the seller has open gets its own socket ID stored here.
-// When an order comes in, we emit to ALL of them simultaneously.
+// Shared socket map — used by sellers, buyers AND riders
+// userId/riderId → Set of socket IDs
 const sellerSockets = new Map()
 
 io.on("connection", (socket) => {
   console.log(`🔌 Socket connected: ${socket.id}`)
 
+  // ── Seller/Buyer registration ──────────────────────────────────────────────
   socket.on("register_seller", (sellerId) => {
     if (!sellerId) return
     const id = String(sellerId)
 
-    // Clean up any stale mapping for this socket first
-    // (handles re-registration after Render wakeup or network switch)
+    // Clean up stale mapping for this socket
     sellerSockets.forEach((sockets, sid) => {
       if (sockets.has(socket.id)) {
         sockets.delete(socket.id)
@@ -57,16 +57,37 @@ io.on("connection", (socket) => {
       }
     })
 
-    // Register under the correct seller ID
     if (!sellerSockets.has(id)) sellerSockets.set(id, new Set())
     sellerSockets.get(id).add(socket.id)
     socket.sellerId = id
 
     const count = sellerSockets.get(id).size
-    console.log(`✅ Seller ${id} registered — socket ${socket.id} (${count} active connection${count !== 1 ? "s" : ""})`)
+    console.log(`✅ Seller/Buyer ${id} registered — socket ${socket.id} (${count} connection${count !== 1 ? "s" : ""})`)
 
-    // Confirm back to client so it knows registration succeeded
     socket.emit("seller_registered", { sellerId: id, socketId: socket.id })
+  })
+
+  // ── Rider registration ─────────────────────────────────────────────────────
+  // Riders use the same map so we can push delivery jobs to them
+  socket.on("register_rider", (riderId) => {
+    if (!riderId) return
+    const id = String(riderId)
+
+    sellerSockets.forEach((sockets, sid) => {
+      if (sockets.has(socket.id)) {
+        sockets.delete(socket.id)
+        if (sockets.size === 0) sellerSockets.delete(sid)
+      }
+    })
+
+    if (!sellerSockets.has(id)) sellerSockets.set(id, new Set())
+    sellerSockets.get(id).add(socket.id)
+    socket.sellerId = id
+
+    const count = sellerSockets.get(id).size
+    console.log(`✅ Rider ${id} registered — socket ${socket.id} (${count} connection${count !== 1 ? "s" : ""})`)
+
+    socket.emit("rider_registered", { riderId: id, socketId: socket.id })
   })
 
   socket.on("disconnect", (reason) => {
@@ -74,9 +95,9 @@ io.on("connection", (socket) => {
     if (id && sellerSockets.has(id)) {
       sellerSockets.get(id).delete(socket.id)
       if (sellerSockets.get(id).size === 0) sellerSockets.delete(id)
-      console.log(`🔌 Seller ${id} socket ${socket.id} disconnected (${reason})`)
+      console.log(`🔌 ${id} disconnected (${reason})`)
     } else {
-      console.log(`🔌 Socket ${socket.id} disconnected (${reason}) — no seller`)
+      console.log(`🔌 Socket ${socket.id} disconnected (${reason})`)
     }
   })
 })
@@ -100,24 +121,39 @@ app.use(cors({
 app.use(express.json())
 app.use(mongoSanitize())
 
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: { message: "Too many requests. Try again later." } })
-app.use("/api/auth", authLimiter)
+// Auth rate limit — 100 req per 15 mins per IP
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max:      100,
+  message:  { message: "Too many requests. Please try again later." },
+})
+app.use("/api/auth",       authLimiter)
+app.use("/api/rider-auth", authLimiter)
 
-const generalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 500 })
+// General rate limit — 500 req per 15 mins per IP
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max:      500,
+  message:  { message: "Too many requests. Please try again later." },
+})
 app.use("/api", generalLimiter)
 
 // ── Routes ─────────────────────────────────────────────────────────────────────
-app.use("/api/auth",     authRoutes)
-app.use("/api/listings", listingRoutes)
-app.use("/api/orders",   orderRoutes)
-app.use("/api/riders",   riderRoutes)
-app.use("/api/admin",    adminRoutes)
-app.use("/api/settings", settingsRoutes)
-app.use("/api/promos",   promoRoutes)
+app.use("/api/auth",       authRoutes)
+app.use("/api/listings",   listingRoutes)
+app.use("/api/orders",     orderRoutes)
+app.use("/api/admin",      adminRoutes)
+app.use("/api/settings",   settingsRoutes)
+app.use("/api/promos",     promoRoutes)
+app.use("/api/rider-auth", riderAuthRoutes)
+app.use("/api/deliveries", deliveryRoutes)
 
-// Health check — Render pings this to keep the server awake
-// Also set this as your Health Check Path in Render dashboard
-app.get("/", (req, res) => res.json({ status: "ok", service: "Silk Road GH API", ts: Date.now() }))
+// Health check — also set this as Health Check Path in Render dashboard
+app.get("/", (req, res) => res.json({
+  status:  "ok",
+  service: "Silk Road GH API",
+  ts:      Date.now(),
+}))
 
 app.use((req, res) => res.status(404).json({ message: "Route not found" }))
 
@@ -132,6 +168,6 @@ mongoose.connect(process.env.MONGODB_URI)
     )
   })
   .catch(err => {
-    console.error("❌ MongoDB connection error:", err.message)
+    console.error("❌ MongoDB error:", err.message)
     process.exit(1)
   })
