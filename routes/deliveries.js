@@ -9,12 +9,16 @@ import { haversineKm, calculateDeliveryFee } from "../utils/distance.js"
 const router = express.Router()
 
 // ── Auth helpers ───────────────────────────────────────────────────────────────
+// Seller uses silkroad_token (role: seller/user)
+// Rider uses silkroad_rider_token (role: rider)
+// Both are verified the same way — we just need the ID
+
 function getUserId(req) {
   try {
     const header = req.headers.authorization
     if (!header?.startsWith("Bearer ")) return null
     const decoded = jwt.verify(header.split(" ")[1], process.env.JWT_SECRET)
-    return decoded.id
+    return decoded.id || null
   } catch { return null }
 }
 
@@ -23,20 +27,20 @@ function getRiderId(req) {
     const header = req.headers.authorization
     if (!header?.startsWith("Bearer ")) return null
     const decoded = jwt.verify(header.split(" ")[1], process.env.JWT_SECRET)
-    return decoded.id
+    return decoded.id || null
   } catch { return null }
 }
 
-// ── Socket push helper ─────────────────────────────────────────────────────────
+// ── Socket push to a specific connected user ───────────────────────────────────
 function pushTo(req, userId, event, data) {
   try {
     const io            = req.app.get("io")
     const sellerSockets = req.app.get("sellerSockets")
-    if (!io || !sellerSockets) return
+    if (!io || !sellerSockets || !userId) return
     const sockets = sellerSockets.get(String(userId))
     if (!sockets || sockets.size === 0) return
     sockets.forEach(socketId => io.to(socketId).emit(event, data))
-    console.log(`📡 Pushed ${event} to ${userId}`)
+    console.log(`📡 Pushed ${event} to user ${userId}`)
   } catch (err) {
     console.error("pushTo error:", err.message)
   }
@@ -47,19 +51,19 @@ function generateOTP() {
   return crypto.randomInt(100000, 999999).toString()
 }
 
-// ── Check if string is valid MongoDB ObjectId ──────────────────────────────────
+// ── MongoDB ObjectId check ─────────────────────────────────────────────────────
 function isMongoId(str) {
   return str && /^[a-f\d]{24}$/i.test(String(str))
 }
 
-// @route POST /api/deliveries/quote
-// Public — calculate fee before creating delivery
+// @route POST /api/deliveries/quote — public, no auth needed
 router.post("/quote", async (req, res) => {
   try {
     const { pickupLat, pickupLng, dropLat, dropLng } = req.body
 
-    if (!pickupLat || !pickupLng || !dropLat || !dropLng) {
-      return res.status(400).json({ message: "All four coordinates are required." })
+    if (pickupLat === undefined || pickupLng === undefined ||
+        dropLat   === undefined || dropLng   === undefined) {
+      return res.status(400).json({ message: "All four coordinates required." })
     }
 
     const pLat = Number(pickupLat)
@@ -82,8 +86,8 @@ router.post("/quote", async (req, res) => {
   }
 })
 
-// @route POST /api/deliveries
-// Seller requests a rider delivery
+// @route POST /api/deliveries — seller requests a rider
+// Requires seller to be logged in
 router.post("/", async (req, res) => {
   try {
     const {
@@ -94,13 +98,17 @@ router.post("/", async (req, res) => {
       itemTitle,     itemImage,     notes,
     } = req.body
 
-    // Seller must be logged in
+    // Verify seller is logged in
     const sellerId = getUserId(req)
-    if (!sellerId) return res.status(401).json({ message: "Not authorized. Please log in." })
+    if (!sellerId) {
+      return res.status(401).json({
+        message: "Please log in as a seller to request a rider."
+      })
+    }
 
-    // Coordinates are required
-    if (!pickupLat || !pickupLng || !dropLat || !dropLng) {
-      return res.status(400).json({ message: "Pickup and drop-off coordinates are required." })
+    if (pickupLat === undefined || pickupLng === undefined ||
+        dropLat   === undefined || dropLng   === undefined) {
+      return res.status(400).json({ message: "Pickup and drop-off coordinates required." })
     }
 
     const pLat = Number(pickupLat)
@@ -112,16 +120,14 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "Invalid coordinates." })
     }
 
-    // Calculate distance and fee
     const distanceKm  = haversineKm(pLat, pLng, dLat, dLng)
     const deliveryFee = calculateDeliveryFee(distanceKm)
 
-    // Only treat orderId as MongoDB reference if it's actually a Mongo ObjectId
-    // Local SR- IDs (e.g. SR-9EZ59N) are stored separately as localOrderId
+    // SR-XXXXXX is a local order ID, not a Mongo ObjectId
     const mongoOrderId = isMongoId(orderId) ? orderId : null
-    const localOrderId = !isMongoId(orderId) ? (orderId || null) : null
+    const localOrderId = !isMongoId(orderId) && orderId ? String(orderId) : null
 
-    // Prevent duplicate delivery for same MongoDB order
+    // Prevent duplicate for same Mongo order
     if (mongoOrderId) {
       const existing = await Delivery.findOne({
         order:  mongoOrderId,
@@ -151,25 +157,27 @@ router.post("/", async (req, res) => {
       status:         "pending",
     })
 
-    console.log(`✅ Delivery created: ${delivery._id} | seller: ${sellerId} | ₵${deliveryFee} | ${distanceKm}km`)
+    console.log(`✅ Delivery ${delivery._id} | seller: ${sellerId} | ₵${deliveryFee} | ${distanceKm}km | localOrderId: ${localOrderId}`)
 
-    // Broadcast new job to ALL connected riders
-    const io            = req.app.get("io")
-    const sellerSockets = req.app.get("sellerSockets")
+    // Broadcast to ALL connected riders
+    const io = req.app.get("io")
     if (io) {
       io.emit("new_delivery_job", {
         deliveryId:    delivery._id.toString(),
+        _id:           delivery._id.toString(),
         itemTitle:     itemTitle  || "Package",
         itemImage:     itemImage  || null,
         pickupAddress: pickupAddress || `${pLat}, ${pLng}`,
         dropAddress:   dropAddress   || `${dLat}, ${dLng}`,
+        pickupLocation:{ lat: pLat, lng: pLng },
+        dropLocation:  { lat: dLat, lng: dLng },
         distanceKm,
         deliveryFee,
         sellerContact: sellerContact || "",
         buyerContact:  buyerContact  || "",
         createdAt:     Date.now(),
       })
-      console.log(`📡 Job broadcast to all riders | ${distanceKm}km | ₵${deliveryFee}`)
+      console.log(`📡 Job broadcast to all riders`)
     }
 
     res.status(201).json({ delivery, distanceKm, deliveryFee })
@@ -180,7 +188,6 @@ router.post("/", async (req, res) => {
 })
 
 // @route GET /api/deliveries/available
-// Riders fetch available pending jobs
 router.get("/available", async (req, res) => {
   try {
     const riderId = getRiderId(req)
@@ -204,7 +211,6 @@ router.get("/available", async (req, res) => {
 })
 
 // @route GET /api/deliveries/my-active
-// Rider's current active delivery
 router.get("/my-active", async (req, res) => {
   try {
     const riderId = getRiderId(req)
@@ -214,7 +220,7 @@ router.get("/my-active", async (req, res) => {
     if (!rider?.activeDelivery) return res.json({ delivery: null })
 
     const delivery = await Delivery.findById(rider.activeDelivery)
-    res.json({ delivery })
+    res.json({ delivery: delivery || null })
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
@@ -228,7 +234,6 @@ router.put("/:id/accept", async (req, res) => {
 
     const rider = await Rider.findById(riderId)
     if (!rider) return res.status(404).json({ message: "Rider not found." })
-
     if (rider.activeDelivery) {
       return res.status(400).json({ message: "You already have an active delivery. Complete it first." })
     }
@@ -247,14 +252,14 @@ router.put("/:id/accept", async (req, res) => {
     rider.activeDelivery = delivery._id
     await rider.save()
 
-    // Notify seller that rider accepted
+    // Notify seller
     pushTo(req, String(delivery.seller), "delivery_accepted", {
       deliveryId:   delivery._id.toString(),
       riderName:    rider.name,
       riderPhone:   rider.phone,
       riderVehicle: rider.vehicle,
       itemTitle:    delivery.itemTitle,
-      message:      `${rider.name} accepted your delivery and is on the way to pick up.`,
+      message:      `${rider.name} accepted your delivery and is heading to pick up the package.`,
     })
 
     res.json({ delivery, rider: { name: rider.name, phone: rider.phone, vehicle: rider.vehicle } })
@@ -268,8 +273,6 @@ router.put("/:id/decline", async (req, res) => {
   try {
     const riderId = getRiderId(req)
     if (!riderId) return res.status(401).json({ message: "Not authorized." })
-
-    // Job stays pending for other riders to accept
     res.json({ message: "Job declined. It remains available for other riders." })
   } catch (err) {
     res.status(500).json({ message: err.message })
@@ -288,7 +291,7 @@ router.put("/:id/picked-up", async (req, res) => {
       return res.status(403).json({ message: "Not your delivery." })
     }
     if (delivery.status !== "accepted") {
-      return res.status(400).json({ message: "Delivery must be accepted before marking picked up." })
+      return res.status(400).json({ message: "Delivery must be in accepted state first." })
     }
 
     delivery.status     = "picked_up"
@@ -308,8 +311,10 @@ router.put("/:id/picked-up", async (req, res) => {
 })
 
 // @route PUT /api/deliveries/:id/delivered
-// Rider marks as delivered — generates OTP that BUYER sees on their screen
-// Buyer reads OTP to rider verbally — rider enters it to confirm
+// ── KEY FIX: OTP stored in DB and returned in response ──
+// Since buyer may be a guest (no socket), OTP is also returned
+// in the API response so the frontend can store it in localStorage
+// keyed by localOrderId — buyer's OrderTracker reads it from there
 router.put("/:id/delivered", async (req, res) => {
   try {
     const riderId = getRiderId(req)
@@ -324,7 +329,6 @@ router.put("/:id/delivered", async (req, res) => {
       return res.status(400).json({ message: "Mark as picked up first." })
     }
 
-    // Generate OTP — buyer sees this, reads it to rider
     const otp             = generateOTP()
     delivery.otp          = otp
     delivery.otpExpiresAt = new Date(Date.now() + 30 * 60 * 1000)
@@ -332,33 +336,74 @@ router.put("/:id/delivered", async (req, res) => {
     delivery.deliveredAt  = new Date()
     await delivery.save()
 
-    // Push OTP to buyer so it shows on their order screen
+    // Try socket push to buyer if they have an account
     if (delivery.buyer) {
       pushTo(req, String(delivery.buyer), "delivery_otp", {
-        deliveryId: delivery._id.toString(),
+        deliveryId:   delivery._id.toString(),
+        localOrderId: delivery.localOrderId,
         otp,
-        itemTitle:  delivery.itemTitle,
-        message:    "Your package has arrived! Give this OTP to the rider to confirm delivery.",
-        expiresAt:  delivery.otpExpiresAt,
+        itemTitle:    delivery.itemTitle,
+        message:      "Your package has arrived! Give this OTP to the rider.",
+        expiresAt:    delivery.otpExpiresAt,
       })
     }
 
-    // Also notify seller
+    // Notify seller
     pushTo(req, String(delivery.seller), "delivery_at_door", {
       deliveryId: delivery._id.toString(),
       itemTitle:  delivery.itemTitle,
-      message:    "Package delivered. Waiting for buyer OTP confirmation.",
+      message:    "Package delivered to buyer. Waiting for OTP confirmation.",
     })
 
-    console.log(`📦 Delivery ${delivery._id} marked delivered | OTP generated`)
-    res.json({ delivery, message: "OTP generated. Ask buyer to read you their code." })
+    console.log(`📦 Delivery ${delivery._id} marked delivered | OTP: ${otp} | localOrderId: ${delivery.localOrderId}`)
+
+    // Return OTP and localOrderId in response
+    // RiderApp will POST this to a public endpoint so buyer's browser can retrieve it
+    res.json({
+      delivery,
+      otp,
+      localOrderId: delivery.localOrderId,
+      message:      "OTP generated. Ask buyer to open their order tracker and read you the code.",
+    })
+  } catch (err) {
+    console.error("Delivered error:", err.message)
+    res.status(500).json({ message: err.message })
+  }
+})
+
+// @route POST /api/deliveries/otp-for-buyer
+// ── NEW: Public endpoint — buyer polls this with their local order ID
+// to get their OTP when the rider marks as delivered ──
+router.get("/otp-for-order/:localOrderId", async (req, res) => {
+  try {
+    const { localOrderId } = req.params
+    if (!localOrderId) return res.status(400).json({ message: "Order ID required." })
+
+    const delivery = await Delivery.findOne({
+      localOrderId,
+      status: "delivered",
+    })
+
+    if (!delivery) {
+      return res.json({ otp: null, message: "No delivery pending OTP for this order." })
+    }
+
+    if (new Date() > delivery.otpExpiresAt) {
+      return res.json({ otp: null, message: "OTP expired." })
+    }
+
+    res.json({
+      otp:          delivery.otp,
+      expiresAt:    delivery.otpExpiresAt,
+      deliveryId:   delivery._id.toString(),
+      itemTitle:    delivery.itemTitle,
+    })
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
 })
 
 // @route PUT /api/deliveries/:id/confirm-otp
-// Rider enters OTP that buyer read to them — completes delivery and releases payment
 router.put("/:id/confirm-otp", async (req, res) => {
   try {
     const riderId = getRiderId(req)
@@ -396,12 +441,12 @@ router.put("/:id/confirm-otp", async (req, res) => {
       await rider.save()
     }
 
-    // Update backend order status if we have a real order ID
+    // Update backend order if we have a real Mongo order ID
     if (delivery.order) {
-      await Order.findByIdAndUpdate(delivery.order, { status: "Completed" })
+      try { await Order.findByIdAndUpdate(delivery.order, { status: "Completed" }) } catch {}
     }
 
-    // Notify seller — payment released
+    // Notify seller
     pushTo(req, String(delivery.seller), "delivery_completed", {
       deliveryId:  delivery._id.toString(),
       itemTitle:   delivery.itemTitle,
@@ -409,7 +454,7 @@ router.put("/:id/confirm-otp", async (req, res) => {
       message:     "Delivery confirmed via OTP. Payment released.",
     })
 
-    // Notify buyer
+    // Notify buyer if they have an account
     if (delivery.buyer) {
       pushTo(req, String(delivery.buyer), "delivery_completed", {
         deliveryId: delivery._id.toString(),
@@ -443,12 +488,9 @@ router.get("/:id", async (req, res) => {
 router.get("/by-order/:orderId", async (req, res) => {
   try {
     const id = req.params.orderId
-
-    // Search by MongoDB order ID or local SR- order ID
     const delivery = isMongoId(id)
       ? await Delivery.findOne({ order: id }).populate("rider", "name phone vehicle")
       : await Delivery.findOne({ localOrderId: id }).populate("rider", "name phone vehicle")
-
     res.json({ delivery: delivery || null })
   } catch (err) {
     res.status(500).json({ message: err.message })
