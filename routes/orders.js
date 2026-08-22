@@ -1,147 +1,126 @@
-import express from "express"
-import jwt     from "jsonwebtoken"
-import Order   from "../models/Order.js"
-import Listing from "../models/Listing.js"
-import protect from "../middleware/auth.js"
+import express  from "express"
+import Order    from "../models/Order.js"
+import Listing  from "../models/Listing.js"
+import protect  from "../middleware/auth.js"
 
 const router = express.Router()
 
-// ── Push real-time notification to seller on ALL their connected devices ────────
-function pushToSeller(req, sellerId, notification) {
+function optionalAuth(req, res, next) {
+  // Attach user if token present, but never block the request
+  try {
+    const header = req.headers.authorization
+    if (header?.startsWith("Bearer ")) {
+      const jwt     = await import("jsonwebtoken")
+      const decoded = jwt.default.verify(header.split(" ")[1], process.env.JWT_SECRET)
+      req.user = { id: decoded.id }
+    }
+  } catch {}
+  next()
+}
+
+function pushToSeller(req, sellerId, data) {
   try {
     const io            = req.app.get("io")
     const sellerSockets = req.app.get("sellerSockets")
-    if (!io || !sellerSockets) return
+    if (!io || !sellerSockets || !sellerId) return
     const sockets = sellerSockets.get(String(sellerId))
-    if (!sockets || sockets.size === 0) {
-      console.log(`📭 Seller ${sellerId} not connected — notification stored only`)
-      return
-    }
-    sockets.forEach(socketId => {
-      io.to(socketId).emit("new_order_notification", notification)
-    })
-    console.log(`📡 Pushed to seller ${sellerId} on ${sockets.size} device(s)`)
+    if (!sockets || sockets.size === 0) return
+    sockets.forEach(socketId => io.to(socketId).emit("new_order", data))
+    console.log(`📡 Notified seller ${sellerId} of new order`)
   } catch (err) {
-    console.error("Socket push error:", err.message)
+    console.error("pushToSeller error:", err.message)
   }
 }
 
-// ── Helper: get buyer ID from token if present (does NOT reject if missing) ────
-function getBuyerId(req) {
-  try {
-    const header = req.headers.authorization
-    if (header && header.startsWith("Bearer ")) {
-      const decoded = jwt.verify(header.split(" ")[1], process.env.JWT_SECRET)
-      return decoded.id || null
-    }
-  } catch {}
-  return null
-}
-
-// @route POST /api/orders — PUBLIC, no auth required
+// @route POST /api/orders — PUBLIC (guests can order)
 router.post("/", async (req, res) => {
   try {
     const {
-      listingId,
-      sellerId,
-      type,
-      amount,
-      paystackRef,
-      location,
-      landmark,
-      extraInfo,
-      contactInfo,
-      rentalDays,
-      promoCode,
-      discount,
-      deliveryMethod,
-      paymentMethod,
-      payerName,
-      payerPhone,
+      listingId, sellerId: bodySellerID, localOrderId,
+      type, amount, paystackRef,
+      location, landmark, extraInfo, contactInfo,
+      payerName, payerPhone, promoCode, discount,
+      deliveryMethod, paymentMethod,
     } = req.body
 
-    if (!listingId && !sellerId) {
-      return res.status(400).json({ message: "listingId or sellerId is required." })
-    }
-
-    // Resolve seller ID and listing info from DB
-    let resolvedSellerId = sellerId || null
-    let listingTitle     = null
+    // Resolve seller from listing if not provided directly
+    let resolvedSellerId = bodySellerID
+    let listingTitle     = "Item"
     let listingImage     = null
 
     if (listingId) {
       try {
-        const listing = await Listing.findById(listingId)
-          .populate("seller", "name")
-          .select("title image seller")
+        const listing = await Listing.findById(listingId).select("seller title image")
         if (listing) {
-          if (!resolvedSellerId) resolvedSellerId = listing.seller?._id?.toString()
-          listingTitle = listing.title
-          listingImage = listing.image
+          resolvedSellerId = resolvedSellerId || String(listing.seller)
+          listingTitle     = listing.title
+          listingImage     = listing.image || null
         }
-      } catch (e) {
-        console.warn("Could not resolve listing:", e.message)
-      }
+      } catch {}
+    }
+
+    if (!resolvedSellerId) {
+      return res.status(400).json({ message: "Could not determine seller. Please try again." })
     }
 
     const platformFee  = Math.round((amount || 0) * 0.08)
     const sellerAmount = (amount || 0) - platformFee
 
-    // Attach buyer ID if logged in (optional)
-    const buyerId = getBuyerId(req)
+    // Try to get buyer ID from token (optional)
+    let buyerId = null
+    try {
+      const header = req.headers.authorization
+      if (header?.startsWith("Bearer ")) {
+        const jwt     = (await import("jsonwebtoken")).default
+        const decoded = jwt.verify(header.split(" ")[1], process.env.JWT_SECRET)
+        buyerId = decoded.id
+      }
+    } catch {}
 
     const order = await Order.create({
       buyer:          buyerId || null,
-      seller:         resolvedSellerId || null,
+      seller:         resolvedSellerId,
       listing:        listingId || null,
+      localOrderId:   localOrderId || null,
       type:           type || "product",
       amount:         amount || 0,
       platformFee,
       sellerAmount,
       paystackRef:    paystackRef || null,
-      location:       location || null,
-      landmark:       landmark || null,
-      extraInfo:      extraInfo || null,
+      location:       location   || null,
+      landmark:       landmark   || null,
+      extraInfo:      extraInfo  || null,
       contactInfo:    contactInfo || null,
-      rentalDays:     rentalDays || null,
-      promoCode:      promoCode || null,
-      discount:       discount || 0,
-      deliveryMethod: deliveryMethod || "pickup",
-      paymentMethod:  paymentMethod || "manual_momo",
-      payerName:      payerName || null,
+      payerName:      payerName  || null,
       payerPhone:     payerPhone || null,
+      promoCode:      promoCode  || null,
+      discount:       discount   || 0,
+      deliveryMethod: deliveryMethod || "pickup",
+      paymentMethod:  paymentMethod  || "manual_momo",
       status:         "In Escrow",
     })
 
-    console.log(`✅ Order ${order._id} | seller: ${resolvedSellerId} | ₵${amount}`)
+    // ── Fire socket notification to seller ──────────────────────────────────
+    pushToSeller(req, resolvedSellerId, {
+      orderId:        localOrderId  || String(order._id),
+      itemTitle:      listingTitle,
+      itemImage:      listingImage,
+      amount:         amount || 0,
+      buyerName:      payerName     || "A buyer",
+      buyerContact:   contactInfo   || payerPhone || "",
+      location:       location      || null,
+      landmark:       landmark      || null,
+      paymentRef:     paystackRef   || null,
+      paymentMethod:  paymentMethod || "manual_momo",
+      deliveryMethod: deliveryMethod || "pickup",
+      discount:       discount      || 0,
+      promoCode:      promoCode     || null,
+    })
 
-    // Fire socket push to seller on all their devices
-    if (resolvedSellerId) {
-      pushToSeller(req, resolvedSellerId, {
-        id:             `NOTIF-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-        type:           "new_order",
-        orderId:        order._id.toString(),
-        sellerId:       String(resolvedSellerId),
-        itemTitle:      listingTitle || "New Order",
-        itemImage:      listingImage || null,
-        amount:         amount || 0,
-        buyerName:      payerName || "A buyer",
-        buyerContact:   contactInfo || payerPhone || null,
-        deliveryMethod: deliveryMethod || "pickup",
-        location:       location || null,
-        landmark:       landmark || null,
-        promoCode:      promoCode || null,
-        discount:       discount || 0,
-        paymentRef:     paystackRef || null,
-        paymentMethod:  paymentMethod || "manual_momo",
-        status:         "unread",
-        createdAt:      Date.now(),
-      })
-    }
-
-    res.status(201).json({ success: true, orderId: order._id, message: "Order created." })
+    console.log(`✅ Order ${order._id} | seller: ${resolvedSellerId} | ₵${amount} | ${deliveryMethod}`)
+    res.status(201).json({ orderId: String(order._id), order })
   } catch (err) {
-    console.error("Order creation error:", err.message)
+    console.error("Create order error:", err.message)
     res.status(500).json({ message: err.message })
   }
 })
@@ -151,7 +130,7 @@ router.get("/my", protect, async (req, res) => {
   try {
     const orders = await Order.find({ buyer: req.user.id })
       .populate("listing", "title image type")
-      .populate("seller",  "name")
+      .populate("seller", "name")
       .sort({ createdAt: -1 })
     res.json(orders)
   } catch (err) {
@@ -172,7 +151,7 @@ router.get("/selling", protect, async (req, res) => {
   }
 })
 
-// @route GET /api/orders/all
+// @route GET /api/orders/all — admin only
 router.get("/all", protect, async (req, res) => {
   try {
     const orders = await Order.find()
@@ -186,16 +165,16 @@ router.get("/all", protect, async (req, res) => {
   }
 })
 
-// @route PUT /api/orders/confirm-by-ref
+// @route PUT /api/orders/confirm-by-ref — MUST be before /:id
 router.put("/confirm-by-ref", protect, async (req, res) => {
   try {
     const { paystackRef } = req.body
-    if (!paystackRef) return res.status(400).json({ message: "Ref required." })
+    if (!paystackRef) return res.status(400).json({ message: "Reference required." })
     const order = await Order.findOne({ paystackRef })
     if (!order) return res.status(404).json({ message: "Order not found." })
     order.status = "Completed"
     await order.save()
-    res.json({ message: "Confirmed. Payment released to seller.", order })
+    res.json({ message: "Delivery confirmed. Payment released.", order })
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
@@ -222,7 +201,7 @@ router.put("/:id/cancel", protect, async (req, res) => {
     order.status    = "Refunded"
     order.cancelled = true
     await order.save()
-    res.json({ message: "Cancelled. Refund initiated.", order })
+    res.json({ message: "Cancelled.", order })
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
