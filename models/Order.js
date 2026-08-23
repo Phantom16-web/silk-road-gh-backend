@@ -1,37 +1,33 @@
 import mongoose from "mongoose"
 
-const orderSchema = new mongoose.Schema({
-buyer: {
-  type: mongoose.Schema.Types.ObjectId,
-  ref: "User",
-  required: false,
-  default: null,
-},
-  seller: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-  listing: { type: mongoose.Schema.Types.ObjectId, ref: "Listing", required: true },
-  type: { type: String, enum: ["product", "rent", "service"], required: true },
-  amount: { type: Number, required: true },
-  platformFee: { type: Number, required: true },
-  sellerAmount: { type: Number, required: true },
-  paystackRef: { type: String },
-  status: { type: String, enum: ["Pending", "In Escrow", "Completed", "Refunded", "Cancelled"], default: "Pending" },
-  location: { type: String },
-  landmark: { type: String },
-  extraInfo: { type: String },
-  contactInfo: { type: String },
+const orderSchema = new mongoose.Schema(
+  {
+    buyer:           { type: mongoose.Schema.Types.ObjectId, ref: "User",    default: null },
+    seller:          { type: mongoose.Schema.Types.ObjectId, ref: "User",    required: true },
+    listing:         { type: mongoose.Schema.Types.ObjectId, ref: "Listing", default: null },
+    localOrderId:    { type: String,  default: null },
+    type:            { type: String,  default: "product" },
+    amount:          { type: Number,  required: true },
+    platformFee:     { type: Number,  default: 0 },
+    sellerAmount:    { type: Number,  default: 0 },
+    paystackRef:     { type: String,  default: null },
+    location:        { type: String,  default: null },
+    landmark:        { type: String,  default: null },
+    extraInfo:       { type: String,  default: null },
+    contactInfo:     { type: String,  default: null },
+    payerName:       { type: String,  default: null },
+    payerPhone:      { type: String,  default: null },
+    promoCode:       { type: String,  default: null },
+    discount:        { type: Number,  default: 0 },
+    deliveryMethod:  { type: String,  default: "pickup" },
+    paymentMethod:   { type: String,  default: "manual_momo" },
+    status:          { type: String,  default: "In Escrow" },
+    cancelled:       { type: Boolean, default: false },
+    renterConfirmed: { type: Boolean, default: false },
+    lenderConfirmed: { type: Boolean, default: false },
+    rentalDays:      { type: Number,  default: null },
+  },
+  { timestamps: true }
+)
 
-  // Rent specific
-  rentalDays: { type: Number },
-  renterConfirmed: { type: Boolean, default: false },
-  lenderConfirmed: { type: Boolean, default: false },
-  damaged: { type: Boolean, default: false },
-
-  // Service specific
-  scheduledDate: { type: String },
-  scheduledTime: { type: String },
-  sessionStarted: { type: Boolean, default: false },
-  sessionEnded: { type: Boolean, default: false },
-  cancelled: { type: Boolean, default: false },
-}, { timestamps: true })
-
-export default mongoose.model("Order", orderSchema)
+export default mongoose.models.Order || mongoose.model("Order", orderSchema)
