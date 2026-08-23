@@ -1,22 +1,10 @@
-import express  from "express"
-import Order    from "../models/Order.js"
-import Listing  from "../models/Listing.js"
-import protect  from "../middleware/auth.js"
+import express from "express"
+import jwt     from "jsonwebtoken"
+import Order   from "../models/Order.js"
+import Listing from "../models/Listing.js"
+import protect from "../middleware/auth.js"
 
 const router = express.Router()
-
-function optionalAuth(req, res, next) {
-  // Attach user if token present, but never block the request
-  try {
-    const header = req.headers.authorization
-    if (header?.startsWith("Bearer ")) {
-      const jwt     = await import("jsonwebtoken")
-      const decoded = jwt.default.verify(header.split(" ")[1], process.env.JWT_SECRET)
-      req.user = { id: decoded.id }
-    }
-  } catch {}
-  next()
-}
 
 function pushToSeller(req, sellerId, data) {
   try {
@@ -32,19 +20,30 @@ function pushToSeller(req, sellerId, data) {
   }
 }
 
-// @route POST /api/orders — PUBLIC (guests can order)
+// @route POST /api/orders — PUBLIC (guests can order, no auth required)
 router.post("/", async (req, res) => {
   try {
     const {
-      listingId, sellerId: bodySellerID, localOrderId,
-      type, amount, paystackRef,
-      location, landmark, extraInfo, contactInfo,
-      payerName, payerPhone, promoCode, discount,
-      deliveryMethod, paymentMethod,
+      listingId,
+      sellerId: bodySellerID,
+      localOrderId,
+      type,
+      amount,
+      paystackRef,
+      location,
+      landmark,
+      extraInfo,
+      contactInfo,
+      payerName,
+      payerPhone,
+      promoCode,
+      discount,
+      deliveryMethod,
+      paymentMethod,
     } = req.body
 
-    // Resolve seller from listing if not provided directly
-    let resolvedSellerId = bodySellerID
+    // Resolve seller + listing details
+    let resolvedSellerId = bodySellerID || null
     let listingTitle     = "Item"
     let listingImage     = null
 
@@ -52,11 +51,13 @@ router.post("/", async (req, res) => {
       try {
         const listing = await Listing.findById(listingId).select("seller title image")
         if (listing) {
-          resolvedSellerId = resolvedSellerId || String(listing.seller)
-          listingTitle     = listing.title
-          listingImage     = listing.image || null
+          if (!resolvedSellerId) resolvedSellerId = String(listing.seller)
+          listingTitle = listing.title || "Item"
+          listingImage = listing.image || null
         }
-      } catch {}
+      } catch (e) {
+        console.warn("Listing lookup failed:", e.message)
+      }
     }
 
     if (!resolvedSellerId) {
@@ -66,58 +67,57 @@ router.post("/", async (req, res) => {
     const platformFee  = Math.round((amount || 0) * 0.08)
     const sellerAmount = (amount || 0) - platformFee
 
-    // Try to get buyer ID from token (optional)
+    // Optionally attach buyer if a valid token is present — never block if missing
     let buyerId = null
     try {
       const header = req.headers.authorization
       if (header?.startsWith("Bearer ")) {
-        const jwt     = (await import("jsonwebtoken")).default
         const decoded = jwt.verify(header.split(" ")[1], process.env.JWT_SECRET)
-        buyerId = decoded.id
+        buyerId = decoded.id || null
       }
     } catch {}
 
     const order = await Order.create({
-      buyer:          buyerId || null,
+      buyer:          buyerId        || null,
       seller:         resolvedSellerId,
-      listing:        listingId || null,
-      localOrderId:   localOrderId || null,
-      type:           type || "product",
-      amount:         amount || 0,
+      listing:        listingId      || null,
+      localOrderId:   localOrderId   || null,
+      type:           type           || "product",
+      amount:         amount         || 0,
       platformFee,
       sellerAmount,
-      paystackRef:    paystackRef || null,
-      location:       location   || null,
-      landmark:       landmark   || null,
-      extraInfo:      extraInfo  || null,
-      contactInfo:    contactInfo || null,
-      payerName:      payerName  || null,
-      payerPhone:     payerPhone || null,
-      promoCode:      promoCode  || null,
-      discount:       discount   || 0,
+      paystackRef:    paystackRef    || null,
+      location:       location       || null,
+      landmark:       landmark       || null,
+      extraInfo:      extraInfo      || null,
+      contactInfo:    contactInfo    || null,
+      payerName:      payerName      || null,
+      payerPhone:     payerPhone     || null,
+      promoCode:      promoCode      || null,
+      discount:       discount       || 0,
       deliveryMethod: deliveryMethod || "pickup",
       paymentMethod:  paymentMethod  || "manual_momo",
       status:         "In Escrow",
     })
 
-    // ── Fire socket notification to seller ──────────────────────────────────
+    // Push real-time notification to seller
     pushToSeller(req, resolvedSellerId, {
-      orderId:        localOrderId  || String(order._id),
+      orderId:        localOrderId   || String(order._id),
       itemTitle:      listingTitle,
       itemImage:      listingImage,
-      amount:         amount || 0,
-      buyerName:      payerName     || "A buyer",
-      buyerContact:   contactInfo   || payerPhone || "",
-      location:       location      || null,
-      landmark:       landmark      || null,
-      paymentRef:     paystackRef   || null,
-      paymentMethod:  paymentMethod || "manual_momo",
+      amount:         amount         || 0,
+      buyerName:      payerName      || "A buyer",
+      buyerContact:   contactInfo    || payerPhone || "",
+      location:       location       || null,
+      landmark:       landmark       || null,
+      paymentRef:     paystackRef    || null,
+      paymentMethod:  paymentMethod  || "manual_momo",
       deliveryMethod: deliveryMethod || "pickup",
-      discount:       discount      || 0,
-      promoCode:      promoCode     || null,
+      discount:       discount       || 0,
+      promoCode:      promoCode      || null,
     })
 
-    console.log(`✅ Order ${order._id} | seller: ${resolvedSellerId} | ₵${amount} | ${deliveryMethod}`)
+    console.log(`✅ Order ${order._id} | seller: ${resolvedSellerId} | ₵${amount} | ${deliveryMethod || "pickup"}`)
     res.status(201).json({ orderId: String(order._id), order })
   } catch (err) {
     console.error("Create order error:", err.message)
@@ -130,7 +130,7 @@ router.get("/my", protect, async (req, res) => {
   try {
     const orders = await Order.find({ buyer: req.user.id })
       .populate("listing", "title image type")
-      .populate("seller", "name")
+      .populate("seller",  "name")
       .sort({ createdAt: -1 })
     res.json(orders)
   } catch (err) {
@@ -151,7 +151,7 @@ router.get("/selling", protect, async (req, res) => {
   }
 })
 
-// @route GET /api/orders/all — admin only
+// @route GET /api/orders/all — admin
 router.get("/all", protect, async (req, res) => {
   try {
     const orders = await Order.find()
