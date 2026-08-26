@@ -17,9 +17,6 @@ function getAnyUserId(req) {
   } catch { return null }
 }
 
-const getUserId  = getAnyUserId
-const getRiderId = getAnyUserId
-
 function pushTo(req, userId, event, data) {
   try {
     const io            = req.app.get("io")
@@ -37,7 +34,7 @@ function isMongoId(str) {
   return str && /^[a-f\d]{24}$/i.test(String(str))
 }
 
-// ─── NAMED ROUTES FIRST — before /:id ────────────────────────────────────────
+// ─── NAMED ROUTES FIRST (before /:id) ────────────────────────────────────────
 
 // POST /api/deliveries/quote
 router.post("/quote", async (req, res) => {
@@ -56,7 +53,7 @@ router.post("/quote", async (req, res) => {
 // GET /api/deliveries/available
 router.get("/available", async (req, res) => {
   try {
-    const riderId = getRiderId(req)
+    const riderId = getAnyUserId(req)
     if (!riderId) return res.status(401).json({ message: "Not authorized." })
     const rider = await Rider.findById(riderId)
     if (!rider) return res.status(404).json({ message: "Rider not found." })
@@ -77,7 +74,7 @@ router.get("/available", async (req, res) => {
 // GET /api/deliveries/my-active
 router.get("/my-active", async (req, res) => {
   try {
-    const riderId = getRiderId(req)
+    const riderId = getAnyUserId(req)
     if (!riderId) return res.status(401).json({ message: "Not authorized." })
     const rider = await Rider.findById(riderId)
     if (!rider) return res.status(404).json({ message: "Rider not found." })
@@ -92,21 +89,19 @@ router.get("/my-active", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// GET /api/deliveries/otp-for-order/:localOrderId  ← PUBLIC, buyer polls this
+// GET /api/deliveries/otp-for-order/:localOrderId — PUBLIC, buyer polls this
 router.get("/otp-for-order/:localOrderId", async (req, res) => {
   try {
     const { localOrderId } = req.params
-    if (!localOrderId) return res.status(400).json({ otp: null })
+    if (!localOrderId) return res.json({ otp: null })
 
-    // Find delivery where rider has marked as delivered
     const delivery = await Delivery.findOne({
       localOrderId,
       status: "delivered",
       otp:    { $exists: true, $ne: null },
     })
 
-    if (!delivery)        return res.json({ otp: null })
-    if (!delivery.otp)    return res.json({ otp: null })
+    if (!delivery || !delivery.otp) return res.json({ otp: null })
     if (new Date() > delivery.otpExpiresAt)
       return res.json({ otp: null, expired: true })
 
@@ -122,14 +117,13 @@ router.get("/otp-for-order/:localOrderId", async (req, res) => {
 // PUT /api/deliveries/force-clear
 router.put("/force-clear", async (req, res) => {
   try {
-    const riderId = getRiderId(req)
+    const riderId = getAnyUserId(req)
     if (!riderId) return res.status(401).json({ message: "Not authorized." })
     const rider = await Rider.findById(riderId)
     if (!rider) return res.status(404).json({ message: "Rider not found." })
     const prev = rider.activeDelivery
     rider.activeDelivery = null
     await rider.save()
-    console.log(`🧹 Force-cleared for rider ${riderId} (was: ${prev})`)
     res.json({ message: "Cleared.", cleared: prev ? String(prev) : null })
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
@@ -145,7 +139,7 @@ router.get("/by-order/:orderId", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// POST /api/deliveries  ← seller creates delivery job
+// POST /api/deliveries — seller creates delivery job
 router.post("/", async (req, res) => {
   try {
     const {
@@ -154,7 +148,7 @@ router.post("/", async (req, res) => {
       sellerContact, buyerContact, itemTitle, itemImage, notes,
     } = req.body
 
-    const sellerId = getUserId(req)
+    const sellerId = getAnyUserId(req)
     if (!sellerId) return res.status(401).json({ message: "Not authorized." })
 
     const pLat = Number(pickupLat), pLng = Number(pickupLng)
@@ -165,6 +159,7 @@ router.post("/", async (req, res) => {
     const distanceKm  = haversineKm(pLat, pLng, dLat, dLng)
     const deliveryFee = calculateDeliveryFee(distanceKm)
 
+    // Preserve SR-XXXXX local order ID so buyer OTP poll can match
     const mongoOrderId = isMongoId(orderId) ? orderId : null
     const localOrderId = !isMongoId(orderId) && orderId ? String(orderId) : null
 
@@ -186,6 +181,7 @@ router.post("/", async (req, res) => {
       status:         "pending",
     })
 
+    // Broadcast to all online riders
     const io = req.app.get("io")
     if (io) {
       io.emit("new_delivery_job", {
@@ -217,7 +213,7 @@ router.post("/", async (req, res) => {
 // PUT /api/deliveries/:id/accept
 router.put("/:id/accept", async (req, res) => {
   try {
-    const riderId = getRiderId(req)
+    const riderId = getAnyUserId(req)
     if (!riderId) return res.status(401).json({ message: "Not authorized." })
     const rider = await Rider.findById(riderId)
     if (!rider) return res.status(404).json({ message: "Rider not found." })
@@ -251,8 +247,6 @@ router.put("/:id/accept", async (req, res) => {
 // PUT /api/deliveries/:id/decline
 router.put("/:id/decline", async (req, res) => {
   try {
-    const riderId = getRiderId(req)
-    if (!riderId) return res.status(401).json({ message: "Not authorized." })
     res.json({ message: "Declined." })
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
@@ -260,7 +254,7 @@ router.put("/:id/decline", async (req, res) => {
 // PUT /api/deliveries/:id/cancel-by-rider
 router.put("/:id/cancel-by-rider", async (req, res) => {
   try {
-    const riderId = getRiderId(req)
+    const riderId = getAnyUserId(req)
     if (!riderId) return res.status(401).json({ message: "Not authorized." })
     const delivery = await Delivery.findById(req.params.id)
     if (!delivery) return res.status(404).json({ message: "Delivery not found." })
@@ -301,7 +295,7 @@ router.put("/:id/cancel-by-rider", async (req, res) => {
 // PUT /api/deliveries/:id/picked-up
 router.put("/:id/picked-up", async (req, res) => {
   try {
-    const riderId = getRiderId(req)
+    const riderId = getAnyUserId(req)
     if (!riderId) return res.status(401).json({ message: "Not authorized." })
     const delivery = await Delivery.findById(req.params.id)
     if (!delivery) return res.status(404).json({ message: "Delivery not found." })
@@ -319,18 +313,19 @@ router.put("/:id/picked-up", async (req, res) => {
 })
 
 // PUT /api/deliveries/:id/delivered
-// ── Rider taps "I've Delivered" → backend generates OTP → stores on delivery
-// ── Buyer side polls GET /otp-for-order/:localOrderId every 5s to get it
+// Rider taps "I've Delivered" → backend generates OTP → stores on delivery
+// Buyer polls GET /otp-for-order/:localOrderId every 5s to get it
+// Buyer also receives OTP instantly via socket if connected
 router.put("/:id/delivered", async (req, res) => {
   try {
-    const riderId = getRiderId(req)
+    const riderId = getAnyUserId(req)
     if (!riderId) return res.status(401).json({ message: "Not authorized." })
     const delivery = await Delivery.findById(req.params.id)
     if (!delivery) return res.status(404).json({ message: "Delivery not found." })
     if (String(delivery.rider) !== String(riderId)) return res.status(403).json({ message: "Not your delivery." })
     if (delivery.status !== "picked_up") return res.status(400).json({ message: `Status is ${delivery.status}, must be picked_up.` })
 
-    // ── Generate OTP and store it ──────────────────────────────────────────
+    // Generate OTP and store it
     const otp             = crypto.randomInt(100000, 999999).toString()
     delivery.otp          = otp
     delivery.otpExpiresAt = new Date(Date.now() + 30 * 60 * 1000) // 30 min
@@ -338,15 +333,26 @@ router.put("/:id/delivered", async (req, res) => {
     delivery.deliveredAt  = new Date()
     await delivery.save()
 
-    console.log(`📦 Delivery ${delivery._id} | OTP: ${otp} | localOrder: ${delivery.localOrderId}`)
+    console.log(`📦 OTP generated | delivery: ${delivery._id} | otp: ${otp} | localOrder: ${delivery.localOrderId}`)
 
-    // Notify seller
+    // Push OTP directly to buyer via socket (instant, if they're connected)
+    if (delivery.buyer) {
+      pushTo(req, String(delivery.buyer), "delivery_otp", {
+        otp,
+        deliveryId:   delivery._id.toString(),
+        localOrderId: delivery.localOrderId,
+        expiresAt:    delivery.otpExpiresAt,
+        itemTitle:    delivery.itemTitle,
+      })
+    }
+
+    // Also notify seller with OTP included so they can see it on their panel
     pushTo(req, String(delivery.seller), "delivery_at_door", {
-      deliveryId: delivery._id.toString(),
-      message:    "Package at buyer's door. Waiting for OTP confirmation.",
+      deliveryId:   delivery._id.toString(),
+      otp,
+      message:      `Package delivered. OTP: ${otp}`,
     })
 
-    // Return OTP in response so rider sees confirmation it was generated
     res.json({ delivery, otp, localOrderId: delivery.localOrderId })
   } catch (err) {
     console.error("Delivered error:", err.message)
@@ -355,10 +361,10 @@ router.put("/:id/delivered", async (req, res) => {
 })
 
 // PUT /api/deliveries/:id/confirm-otp
-// ── Rider submits OTP they received verbally from buyer → verified → completed
+// Rider enters OTP they heard from buyer → verified → order COMPLETED
 router.put("/:id/confirm-otp", async (req, res) => {
   try {
-    const riderId = getRiderId(req)
+    const riderId = getAnyUserId(req)
     if (!riderId) return res.status(401).json({ message: "Not authorized." })
     const { otp } = req.body
     if (!otp) return res.status(400).json({ message: "OTP required." })
@@ -389,7 +395,7 @@ router.put("/:id/confirm-otp", async (req, res) => {
     pushTo(req, String(delivery.seller), "delivery_completed", {
       deliveryId:  delivery._id.toString(),
       deliveryFee: delivery.deliveryFee,
-      message:     "Delivery confirmed. Payment released.",
+      message:     "Delivery confirmed via OTP. Payment released.",
     })
 
     console.log(`✅ Delivery ${delivery._id} completed | ₵${delivery.deliveryFee}`)
@@ -397,7 +403,7 @@ router.put("/:id/confirm-otp", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// GET /api/deliveries/:id  ← MUST BE LAST
+// GET /api/deliveries/:id — MUST BE LAST
 router.get("/:id", async (req, res) => {
   try {
     const delivery = await Delivery.findById(req.params.id)
@@ -409,4 +415,3 @@ router.get("/:id", async (req, res) => {
 })
 
 export default router
-
