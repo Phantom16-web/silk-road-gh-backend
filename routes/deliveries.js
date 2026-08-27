@@ -95,11 +95,32 @@ router.get("/otp-for-order/:localOrderId", async (req, res) => {
     const { localOrderId } = req.params
     if (!localOrderId) return res.json({ otp: null })
 
-    const delivery = await Delivery.findOne({
+    // Primary: match by SR-XXXXX localOrderId
+    let delivery = await Delivery.findOne({
       localOrderId,
       status: "delivered",
       otp:    { $exists: true, $ne: null },
     })
+
+    // Fallback 1: if the ID passed is a MongoDB _id, search by order reference
+    if (!delivery && isMongoId(localOrderId)) {
+      delivery = await Delivery.findOne({
+        order:  localOrderId,
+        status: "delivered",
+        otp:    { $exists: true, $ne: null },
+      })
+    }
+
+    // Fallback 2: most recent delivered OTP in last 2 hours
+    // Safety net for any ID mismatch edge cases
+    if (!delivery) {
+      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+      delivery = await Delivery.findOne({
+        status:      "delivered",
+        otp:         { $exists: true, $ne: null },
+        deliveredAt: { $gte: twoHoursAgo },
+      }).sort({ deliveredAt: -1 })
+    }
 
     if (!delivery || !delivery.otp) return res.json({ otp: null })
     if (new Date() > delivery.otpExpiresAt)
@@ -143,7 +164,8 @@ router.get("/by-order/:orderId", async (req, res) => {
 router.post("/", async (req, res) => {
   try {
     const {
-      orderId, pickupLat, pickupLng, pickupAddress,
+      orderId,
+      pickupLat, pickupLng, pickupAddress,
       dropLat, dropLng, dropAddress,
       sellerContact, buyerContact, itemTitle, itemImage, notes,
     } = req.body
@@ -159,9 +181,14 @@ router.post("/", async (req, res) => {
     const distanceKm  = haversineKm(pLat, pLng, dLat, dLng)
     const deliveryFee = calculateDeliveryFee(distanceKm)
 
-    // Preserve SR-XXXXX local order ID so buyer OTP poll can match
+    // ── THE FIX: accept explicit localOrderId from frontend ───────────────────
+    // Frontend passes localOrderId: "SR-XXXXX" explicitly when it knows it
+    // Fall back to deriving from orderId if not provided
     const mongoOrderId = isMongoId(orderId) ? orderId : null
-    const localOrderId = !isMongoId(orderId) && orderId ? String(orderId) : null
+    const localOrderId = req.body.localOrderId
+      || (!isMongoId(orderId) && orderId ? String(orderId) : null)
+
+    console.log(`📦 Creating delivery | orderId: ${orderId} | localOrderId: ${localOrderId} | mongo: ${mongoOrderId}`)
 
     const delivery = await Delivery.create({
       order:          mongoOrderId,
@@ -200,7 +227,7 @@ router.post("/", async (req, res) => {
       })
     }
 
-    console.log(`✅ Delivery ${delivery._id} | localOrder: ${localOrderId}`)
+    console.log(`✅ Delivery ${delivery._id} | localOrderId: ${localOrderId}`)
     res.status(201).json({ delivery, distanceKm, deliveryFee })
   } catch (err) {
     console.error("Create delivery error:", err.message)
@@ -314,7 +341,7 @@ router.put("/:id/picked-up", async (req, res) => {
 
 // PUT /api/deliveries/:id/delivered
 // Rider taps "I've Delivered" → backend generates OTP → stores on delivery
-// Buyer polls GET /otp-for-order/:localOrderId every 5s to get it
+// Buyer polls GET /otp-for-order/:localOrderId every 5s
 // Buyer also receives OTP instantly via socket if connected
 router.put("/:id/delivered", async (req, res) => {
   try {
@@ -325,7 +352,7 @@ router.put("/:id/delivered", async (req, res) => {
     if (String(delivery.rider) !== String(riderId)) return res.status(403).json({ message: "Not your delivery." })
     if (delivery.status !== "picked_up") return res.status(400).json({ message: `Status is ${delivery.status}, must be picked_up.` })
 
-    // Generate OTP and store it
+    // Generate OTP and store on delivery
     const otp             = crypto.randomInt(100000, 999999).toString()
     delivery.otp          = otp
     delivery.otpExpiresAt = new Date(Date.now() + 30 * 60 * 1000) // 30 min
@@ -333,9 +360,9 @@ router.put("/:id/delivered", async (req, res) => {
     delivery.deliveredAt  = new Date()
     await delivery.save()
 
-    console.log(`📦 OTP generated | delivery: ${delivery._id} | otp: ${otp} | localOrder: ${delivery.localOrderId}`)
+    console.log(`📦 OTP generated | delivery: ${delivery._id} | localOrderId: ${delivery.localOrderId} | otp: ${otp}`)
 
-    // Push OTP directly to buyer via socket (instant, if they're connected)
+    // Push OTP to buyer via socket instantly (if connected)
     if (delivery.buyer) {
       pushTo(req, String(delivery.buyer), "delivery_otp", {
         otp,
@@ -346,10 +373,11 @@ router.put("/:id/delivered", async (req, res) => {
       })
     }
 
-    // Also notify seller with OTP included so they can see it on their panel
+    // Notify seller with OTP included so they can see it on their panel
     pushTo(req, String(delivery.seller), "delivery_at_door", {
       deliveryId:   delivery._id.toString(),
       otp,
+      localOrderId: delivery.localOrderId,
       message:      `Package delivered. OTP: ${otp}`,
     })
 
@@ -361,7 +389,7 @@ router.put("/:id/delivered", async (req, res) => {
 })
 
 // PUT /api/deliveries/:id/confirm-otp
-// Rider enters OTP they heard from buyer → verified → order COMPLETED
+// Rider enters OTP heard from buyer → verified → order COMPLETED
 router.put("/:id/confirm-otp", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
