@@ -102,7 +102,7 @@ router.get("/otp-for-order/:localOrderId", async (req, res) => {
       otp:    { $exists: true, $ne: null },
     })
 
-    // Fallback 1: if the ID passed is a MongoDB _id, search by order reference
+    // Fallback 1: MongoDB _id reference
     if (!delivery && isMongoId(localOrderId)) {
       delivery = await Delivery.findOne({
         order:  localOrderId,
@@ -112,7 +112,6 @@ router.get("/otp-for-order/:localOrderId", async (req, res) => {
     }
 
     // Fallback 2: most recent delivered OTP in last 2 hours
-    // Safety net for any ID mismatch edge cases
     if (!delivery) {
       const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
       delivery = await Delivery.findOne({
@@ -181,14 +180,11 @@ router.post("/", async (req, res) => {
     const distanceKm  = haversineKm(pLat, pLng, dLat, dLng)
     const deliveryFee = calculateDeliveryFee(distanceKm)
 
-    // ── THE FIX: accept explicit localOrderId from frontend ───────────────────
-    // Frontend passes localOrderId: "SR-XXXXX" explicitly when it knows it
-    // Fall back to deriving from orderId if not provided
     const mongoOrderId = isMongoId(orderId) ? orderId : null
     const localOrderId = req.body.localOrderId
       || (!isMongoId(orderId) && orderId ? String(orderId) : null)
 
-    console.log(`📦 Creating delivery | orderId: ${orderId} | localOrderId: ${localOrderId} | mongo: ${mongoOrderId}`)
+    console.log(`📦 Creating delivery | orderId: ${orderId} | localOrderId: ${localOrderId}`)
 
     const delivery = await Delivery.create({
       order:          mongoOrderId,
@@ -208,7 +204,6 @@ router.post("/", async (req, res) => {
       status:         "pending",
     })
 
-    // Broadcast to all online riders
     const io = req.app.get("io")
     if (io) {
       io.emit("new_delivery_job", {
@@ -341,8 +336,8 @@ router.put("/:id/picked-up", async (req, res) => {
 
 // PUT /api/deliveries/:id/delivered
 // Rider taps "I've Delivered" → backend generates OTP → stores on delivery
-// Buyer polls GET /otp-for-order/:localOrderId every 5s
-// Buyer also receives OTP instantly via socket if connected
+// OTP broadcast on a localOrderId-specific channel so ONLY that buyer gets it
+// Seller is notified WITHOUT the OTP — seller has no business seeing the OTP
 router.put("/:id/delivered", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
@@ -352,19 +347,23 @@ router.put("/:id/delivered", async (req, res) => {
     if (String(delivery.rider) !== String(riderId)) return res.status(403).json({ message: "Not your delivery." })
     if (delivery.status !== "picked_up") return res.status(400).json({ message: `Status is ${delivery.status}, must be picked_up.` })
 
-    // Generate OTP and store on delivery
+    // Generate OTP — stored on delivery, never sent to seller
     const otp             = crypto.randomInt(100000, 999999).toString()
     delivery.otp          = otp
-    delivery.otpExpiresAt = new Date(Date.now() + 30 * 60 * 1000) // 30 min
+    delivery.otpExpiresAt = new Date(Date.now() + 30 * 60 * 1000)
     delivery.status       = "delivered"
     delivery.deliveredAt  = new Date()
     await delivery.save()
 
     console.log(`📦 OTP generated | delivery: ${delivery._id} | localOrderId: ${delivery.localOrderId} | otp: ${otp}`)
 
-    // Push OTP to buyer via socket instantly (if connected)
-    if (delivery.buyer) {
-      pushTo(req, String(delivery.buyer), "delivery_otp", {
+    const io = req.app.get("io")
+
+    // ── Broadcast OTP on the order-specific channel ───────────────────────────
+    // Any client (guest or logged-in) subscribed to this localOrderId gets it
+    // Checkout.jsx and OrderTracker listen for "otp:SR-XXXXX" room event
+    if (io && delivery.localOrderId) {
+      io.emit(`otp:${delivery.localOrderId}`, {
         otp,
         deliveryId:   delivery._id.toString(),
         localOrderId: delivery.localOrderId,
@@ -373,15 +372,14 @@ router.put("/:id/delivered", async (req, res) => {
       })
     }
 
-    // Notify seller with OTP included so they can see it on their panel
+    // ── Notify seller WITHOUT OTP — they only need to know it's at the door ──
     pushTo(req, String(delivery.seller), "delivery_at_door", {
-      deliveryId:   delivery._id.toString(),
-      otp,
-      localOrderId: delivery.localOrderId,
-      message:      `Package delivered. OTP: ${otp}`,
+      deliveryId: delivery._id.toString(),
+      message:    "Package delivered. Waiting for buyer OTP confirmation.",
+      // NO otp field here — seller never sees the OTP
     })
 
-    res.json({ delivery, otp, localOrderId: delivery.localOrderId })
+    res.json({ delivery, localOrderId: delivery.localOrderId })
   } catch (err) {
     console.error("Delivered error:", err.message)
     res.status(500).json({ message: err.message })
@@ -389,7 +387,6 @@ router.put("/:id/delivered", async (req, res) => {
 })
 
 // PUT /api/deliveries/:id/confirm-otp
-// Rider enters OTP heard from buyer → verified → order COMPLETED
 router.put("/:id/confirm-otp", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
