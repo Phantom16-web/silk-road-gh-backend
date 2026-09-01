@@ -37,9 +37,39 @@ const io = new Server(httpServer, {
   pingInterval: 25000,
 })
 
-// Shared socket map — used by sellers, buyers AND riders
-// userId/riderId → Set of socket IDs
+// userId → Set<socketId>
 const sellerSockets = new Map()
+
+// ── Pending notification queue ─────────────────────────────────────────────────
+// If a seller is offline when an order comes in, we queue the notification.
+// When they connect and register, we flush the queue to them immediately.
+// userId → Array<{ event, data, ts }>
+const pendingNotifications = new Map()
+
+const MAX_QUEUE_AGE_MS = 24 * 60 * 60 * 1000 // 24 hours — older ones are dropped
+
+export function queueNotification(sellerId, event, data) {
+  const id = String(sellerId)
+  if (!pendingNotifications.has(id)) pendingNotifications.set(id, [])
+  pendingNotifications.get(id).push({ event, data, ts: Date.now() })
+  console.log(`📬 Queued "${event}" for seller ${id} (offline)`)
+}
+
+function flushPendingNotifications(sellerId, socketId) {
+  const id = String(sellerId)
+  const queue = pendingNotifications.get(id)
+  if (!queue || queue.length === 0) return
+
+  const now = Date.now()
+  const fresh = queue.filter(n => now - n.ts < MAX_QUEUE_AGE_MS)
+
+  if (fresh.length > 0) {
+    console.log(`📨 Flushing ${fresh.length} queued notification(s) to seller ${id}`)
+    fresh.forEach(n => io.to(socketId).emit(n.event, { ...n.data, queued: true }))
+  }
+
+  pendingNotifications.delete(id)
+}
 
 io.on("connection", (socket) => {
   console.log(`🔌 Socket connected: ${socket.id}`)
@@ -49,7 +79,7 @@ io.on("connection", (socket) => {
     if (!sellerId) return
     const id = String(sellerId)
 
-    // Clean up stale mapping for this socket
+    // Remove this socket from any previous seller mapping
     sellerSockets.forEach((sockets, sid) => {
       if (sockets.has(socket.id)) {
         sockets.delete(socket.id)
@@ -65,10 +95,12 @@ io.on("connection", (socket) => {
     console.log(`✅ Seller/Buyer ${id} registered — socket ${socket.id} (${count} connection${count !== 1 ? "s" : ""})`)
 
     socket.emit("seller_registered", { sellerId: id, socketId: socket.id })
+
+    // ── Flush any queued notifications they missed while offline ──────────────
+    flushPendingNotifications(id, socket.id)
   })
 
   // ── Rider registration ─────────────────────────────────────────────────────
-  // Riders use the same map so we can push delivery jobs to them
   socket.on("register_rider", (riderId) => {
     if (!riderId) return
     const id = String(riderId)
@@ -102,9 +134,9 @@ io.on("connection", (socket) => {
   })
 })
 
-// Attach to app so routes can use them
 app.set("io", io)
 app.set("sellerSockets", sellerSockets)
+app.set("queueNotification", queueNotification)
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 app.use(helmet())
@@ -121,7 +153,6 @@ app.use(cors({
 app.use(express.json())
 app.use(mongoSanitize())
 
-// Auth rate limit — 100 req per 15 mins per IP
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max:      100,
@@ -130,7 +161,6 @@ const authLimiter = rateLimit({
 app.use("/api/auth",       authLimiter)
 app.use("/api/rider-auth", authLimiter)
 
-// General rate limit — 500 req per 15 mins per IP
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max:      500,
@@ -148,7 +178,6 @@ app.use("/api/promos",     promoRoutes)
 app.use("/api/rider-auth", riderAuthRoutes)
 app.use("/api/deliveries", deliveryRoutes)
 
-// Health check — also set this as Health Check Path in Render dashboard
 app.get("/", (req, res) => res.json({
   status:  "ok",
   service: "Silk Road GH API",
