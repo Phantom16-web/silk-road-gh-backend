@@ -21,9 +21,29 @@ function pushTo(req, userId, event, data) {
   try {
     const io            = req.app.get("io")
     const sellerSockets = req.app.get("sellerSockets")
+    const queueNotif    = req.app.get("queueNotification")
     if (!io || !sellerSockets || !userId) return
+
     const sockets = sellerSockets.get(String(userId))
-    if (!sockets || sockets.size === 0) return
+
+    if (!sockets || sockets.size === 0) {
+      // Queue delivery status events for offline sellers
+      // Do NOT queue OTP events — they are time-sensitive and only valid
+      // while the rider is at the door. The buyer poll handles OTP recovery.
+      const queueable = [
+        "delivery_accepted",
+        "delivery_picked_up",
+        "delivery_at_door",
+        "delivery_completed",
+        "delivery_cancelled_by_rider",
+      ]
+      if (queueNotif && queueable.includes(event)) {
+        queueNotif(String(userId), event, data)
+        console.log(`📬 ${userId} offline — "${event}" queued`)
+      }
+      return
+    }
+
     sockets.forEach(socketId => io.to(socketId).emit(event, data))
   } catch (err) {
     console.error("pushTo error:", err.message)
@@ -111,7 +131,7 @@ router.get("/otp-for-order/:localOrderId", async (req, res) => {
       })
     }
 
-    // Fallback 2: most recent delivered OTP in last 2 hours
+    // Fallback 2: most recent delivered OTP within last 2 hours
     if (!delivery) {
       const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
       delivery = await Delivery.findOne({
@@ -180,6 +200,7 @@ router.post("/", async (req, res) => {
     const distanceKm  = haversineKm(pLat, pLng, dLat, dLng)
     const deliveryFee = calculateDeliveryFee(distanceKm)
 
+    // Preserve SR-XXXXX so buyer OTP poll can match
     const mongoOrderId = isMongoId(orderId) ? orderId : null
     const localOrderId = req.body.localOrderId
       || (!isMongoId(orderId) && orderId ? String(orderId) : null)
@@ -204,6 +225,7 @@ router.post("/", async (req, res) => {
       status:         "pending",
     })
 
+    // Broadcast to all online riders
     const io = req.app.get("io")
     if (io) {
       io.emit("new_delivery_job", {
@@ -336,8 +358,8 @@ router.put("/:id/picked-up", async (req, res) => {
 
 // PUT /api/deliveries/:id/delivered
 // Rider taps "I've Delivered" → backend generates OTP → stores on delivery
-// OTP broadcast on a localOrderId-specific channel so ONLY that buyer gets it
-// Seller is notified WITHOUT the OTP — seller has no business seeing the OTP
+// OTP broadcast on order-specific channel — only that buyer gets it
+// Seller notified WITHOUT the OTP
 router.put("/:id/delivered", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
@@ -359,9 +381,8 @@ router.put("/:id/delivered", async (req, res) => {
 
     const io = req.app.get("io")
 
-    // ── Broadcast OTP on the order-specific channel ───────────────────────────
-    // Any client (guest or logged-in) subscribed to this localOrderId gets it
-    // Checkout.jsx and OrderTracker listen for "otp:SR-XXXXX" room event
+    // Broadcast OTP on the order-specific channel — only the buyer holding
+    // that exact localOrderId receives it. Guest or logged-in, doesn't matter.
     if (io && delivery.localOrderId) {
       io.emit(`otp:${delivery.localOrderId}`, {
         otp,
@@ -372,11 +393,10 @@ router.put("/:id/delivered", async (req, res) => {
       })
     }
 
-    // ── Notify seller WITHOUT OTP — they only need to know it's at the door ──
+    // Notify seller WITHOUT OTP — seller has no business seeing the OTP
     pushTo(req, String(delivery.seller), "delivery_at_door", {
       deliveryId: delivery._id.toString(),
       message:    "Package delivered. Waiting for buyer OTP confirmation.",
-      // NO otp field here — seller never sees the OTP
     })
 
     res.json({ delivery, localOrderId: delivery.localOrderId })
@@ -387,6 +407,7 @@ router.put("/:id/delivered", async (req, res) => {
 })
 
 // PUT /api/deliveries/:id/confirm-otp
+// Rider enters OTP heard from buyer → verified → order COMPLETED
 router.put("/:id/confirm-otp", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
