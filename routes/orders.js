@@ -10,9 +10,18 @@ function pushToSeller(req, sellerId, data) {
   try {
     const io            = req.app.get("io")
     const sellerSockets = req.app.get("sellerSockets")
+    const queueNotif    = req.app.get("queueNotification")
     if (!io || !sellerSockets || !sellerId) return
+
     const sockets = sellerSockets.get(String(sellerId))
-    if (!sockets || sockets.size === 0) return
+
+    if (!sockets || sockets.size === 0) {
+      // Seller is offline — queue so they get it the moment they reconnect
+      if (queueNotif) queueNotif(String(sellerId), "new_order", data)
+      console.log(`📬 Seller ${sellerId} offline — new_order queued`)
+      return
+    }
+
     sockets.forEach(socketId => io.to(socketId).emit("new_order", data))
     console.log(`📡 Notified seller ${sellerId} of new order`)
   } catch (err) {
@@ -78,43 +87,43 @@ router.post("/", async (req, res) => {
     } catch {}
 
     const order = await Order.create({
-      buyer:          buyerId        || null,
+      buyer:          buyerId          || null,
       seller:         resolvedSellerId,
-      listing:        listingId      || null,
-      localOrderId:   localOrderId   || null,
-      type:           type           || "product",
-      amount:         amount         || 0,
+      listing:        listingId        || null,
+      localOrderId:   localOrderId     || null,
+      type:           type             || "product",
+      amount:         amount           || 0,
       platformFee,
       sellerAmount,
-      paystackRef:    paystackRef    || null,
-      location:       location       || null,
-      landmark:       landmark       || null,
-      extraInfo:      extraInfo      || null,
-      contactInfo:    contactInfo    || null,
-      payerName:      payerName      || null,
-      payerPhone:     payerPhone     || null,
-      promoCode:      promoCode      || null,
-      discount:       discount       || 0,
-      deliveryMethod: deliveryMethod || "pickup",
-      paymentMethod:  paymentMethod  || "manual_momo",
+      paystackRef:    paystackRef      || null,
+      location:       location         || null,
+      landmark:       landmark         || null,
+      extraInfo:      extraInfo        || null,
+      contactInfo:    contactInfo      || null,
+      payerName:      payerName        || null,
+      payerPhone:     payerPhone       || null,
+      promoCode:      promoCode        || null,
+      discount:       discount         || 0,
+      deliveryMethod: deliveryMethod   || "pickup",
+      paymentMethod:  paymentMethod    || "manual_momo",
       status:         "In Escrow",
     })
 
-    // Push real-time notification to seller
+    // Push real-time notification to seller (queued if offline)
     pushToSeller(req, resolvedSellerId, {
-      orderId:        localOrderId   || String(order._id),
+      orderId:        localOrderId     || String(order._id),
       itemTitle:      listingTitle,
       itemImage:      listingImage,
-      amount:         amount         || 0,
-      buyerName:      payerName      || "A buyer",
-      buyerContact:   contactInfo    || payerPhone || "",
-      location:       location       || null,
-      landmark:       landmark       || null,
-      paymentRef:     paystackRef    || null,
-      paymentMethod:  paymentMethod  || "manual_momo",
-      deliveryMethod: deliveryMethod || "pickup",
-      discount:       discount       || 0,
-      promoCode:      promoCode      || null,
+      amount:         amount           || 0,
+      buyerName:      payerName        || "A buyer",
+      buyerContact:   contactInfo      || payerPhone || "",
+      location:       location         || null,
+      landmark:       landmark         || null,
+      paymentRef:     paystackRef      || null,
+      paymentMethod:  paymentMethod    || "manual_momo",
+      deliveryMethod: deliveryMethod   || "pickup",
+      discount:       discount         || 0,
+      promoCode:      promoCode        || null,
     })
 
     console.log(`✅ Order ${order._id} | seller: ${resolvedSellerId} | ₵${amount} | ${deliveryMethod || "pickup"}`)
