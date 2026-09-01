@@ -16,7 +16,6 @@ function pushToSeller(req, sellerId, data) {
     const sockets = sellerSockets.get(String(sellerId))
 
     if (!sockets || sockets.size === 0) {
-      // Seller is offline — queue so they get it the moment they reconnect
       if (queueNotif) queueNotif(String(sellerId), "new_order", data)
       console.log(`📬 Seller ${sellerId} offline — new_order queued`)
       return
@@ -29,7 +28,7 @@ function pushToSeller(req, sellerId, data) {
   }
 }
 
-// @route POST /api/orders — PUBLIC (guests can order, no auth required)
+// @route POST /api/orders — PUBLIC
 router.post("/", async (req, res) => {
   try {
     const {
@@ -51,7 +50,6 @@ router.post("/", async (req, res) => {
       paymentMethod,
     } = req.body
 
-    // Resolve seller + listing details
     let resolvedSellerId = bodySellerID || null
     let listingTitle     = "Item"
     let listingImage     = null
@@ -76,7 +74,6 @@ router.post("/", async (req, res) => {
     const platformFee  = Math.round((amount || 0) * 0.08)
     const sellerAmount = (amount || 0) - platformFee
 
-    // Optionally attach buyer if a valid token is present — never block if missing
     let buyerId = null
     try {
       const header = req.headers.authorization
@@ -109,7 +106,6 @@ router.post("/", async (req, res) => {
       status:         "In Escrow",
     })
 
-    // Push real-time notification to seller (queued if offline)
     pushToSeller(req, resolvedSellerId, {
       orderId:        localOrderId     || String(order._id),
       itemTitle:      listingTitle,
@@ -130,6 +126,48 @@ router.post("/", async (req, res) => {
     res.status(201).json({ orderId: String(order._id), order })
   } catch (err) {
     console.error("Create order error:", err.message)
+    res.status(500).json({ message: err.message })
+  }
+})
+
+// @route GET /api/orders/track/:localOrderId — PUBLIC
+// Lets any device look up an order by SR-XXXXX even if localStorage is empty
+router.get("/track/:localOrderId", async (req, res) => {
+  try {
+    const { localOrderId } = req.params
+    if (!localOrderId) return res.status(400).json({ message: "Order ID required." })
+
+    const order = await Order.findOne({ localOrderId })
+      .populate("listing", "title image category")
+      .populate("seller",  "name university")
+
+    if (!order) return res.status(404).json({ message: "Order not found." })
+
+    // Return only the fields the buyer needs — no sensitive seller data
+    res.json({
+      id:             order.localOrderId,
+      backendOrderId: String(order._id),
+      status:         order.status,
+      amount:         order.amount,
+      deliveryMethod: order.deliveryMethod,
+      paymentMethod:  order.paymentMethod,
+      location:       order.location,
+      landmark:       order.landmark,
+      extraInfo:      order.extraInfo,
+      payerName:      order.payerName,
+      itemTitle:      order.listing?.title  || "Item",
+      itemImage:      order.listing?.image  || null,
+      category:       order.listing?.category || null,
+      sellerName:     order.seller?.name    || null,
+      sellerUni:      order.seller?.university || null,
+      promoCode:      order.promoCode,
+      discount:       order.discount,
+      createdAt:      order.createdAt,
+      delivered:      order.status === "Completed" ? true
+                    : order.status === "Refunded"  ? false
+                    : null,
+    })
+  } catch (err) {
     res.status(500).json({ message: err.message })
   }
 })
