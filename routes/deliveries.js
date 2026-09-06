@@ -27,15 +27,13 @@ function pushTo(req, userId, event, data) {
     const sockets = sellerSockets.get(String(userId))
 
     if (!sockets || sockets.size === 0) {
-      // Queue delivery status events for offline sellers
-      // Do NOT queue OTP events — they are time-sensitive and only valid
-      // while the rider is at the door. The buyer poll handles OTP recovery.
       const queueable = [
         "delivery_accepted",
         "delivery_picked_up",
         "delivery_at_door",
         "delivery_completed",
         "delivery_cancelled_by_rider",
+        "sale_completed",
       ]
       if (queueNotif && queueable.includes(event)) {
         queueNotif(String(userId), event, data)
@@ -56,7 +54,6 @@ function isMongoId(str) {
 
 // ─── NAMED ROUTES FIRST (before /:id) ────────────────────────────────────────
 
-// POST /api/deliveries/quote
 router.post("/quote", async (req, res) => {
   try {
     const { pickupLat, pickupLng, dropLat, dropLng } = req.body
@@ -70,7 +67,6 @@ router.post("/quote", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// GET /api/deliveries/available
 router.get("/available", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
@@ -91,7 +87,6 @@ router.get("/available", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// GET /api/deliveries/my-active
 router.get("/my-active", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
@@ -115,14 +110,12 @@ router.get("/otp-for-order/:localOrderId", async (req, res) => {
     const { localOrderId } = req.params
     if (!localOrderId) return res.json({ otp: null })
 
-    // Primary: match by SR-XXXXX localOrderId
     let delivery = await Delivery.findOne({
       localOrderId,
       status: "delivered",
       otp:    { $exists: true, $ne: null },
     })
 
-    // Fallback 1: MongoDB _id reference
     if (!delivery && isMongoId(localOrderId)) {
       delivery = await Delivery.findOne({
         order:  localOrderId,
@@ -131,7 +124,6 @@ router.get("/otp-for-order/:localOrderId", async (req, res) => {
       })
     }
 
-    // Fallback 2: most recent delivered OTP within last 2 hours
     if (!delivery) {
       const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
       delivery = await Delivery.findOne({
@@ -154,7 +146,6 @@ router.get("/otp-for-order/:localOrderId", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// PUT /api/deliveries/force-clear
 router.put("/force-clear", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
@@ -168,7 +159,6 @@ router.put("/force-clear", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// GET /api/deliveries/by-order/:orderId
 router.get("/by-order/:orderId", async (req, res) => {
   try {
     const id = req.params.orderId
@@ -179,7 +169,6 @@ router.get("/by-order/:orderId", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// POST /api/deliveries — seller creates delivery job
 router.post("/", async (req, res) => {
   try {
     const {
@@ -200,7 +189,6 @@ router.post("/", async (req, res) => {
     const distanceKm  = haversineKm(pLat, pLng, dLat, dLng)
     const deliveryFee = calculateDeliveryFee(distanceKm)
 
-    // Preserve SR-XXXXX so buyer OTP poll can match
     const mongoOrderId = isMongoId(orderId) ? orderId : null
     const localOrderId = req.body.localOrderId
       || (!isMongoId(orderId) && orderId ? String(orderId) : null)
@@ -225,7 +213,6 @@ router.post("/", async (req, res) => {
       status:         "pending",
     })
 
-    // Broadcast to all online riders
     const io = req.app.get("io")
     if (io) {
       io.emit("new_delivery_job", {
@@ -254,7 +241,6 @@ router.post("/", async (req, res) => {
 
 // ─── /:id ROUTES BELOW ────────────────────────────────────────────────────────
 
-// PUT /api/deliveries/:id/accept
 router.put("/:id/accept", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
@@ -288,14 +274,12 @@ router.put("/:id/accept", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// PUT /api/deliveries/:id/decline
 router.put("/:id/decline", async (req, res) => {
   try {
     res.json({ message: "Declined." })
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// PUT /api/deliveries/:id/cancel-by-rider
 router.put("/:id/cancel-by-rider", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
@@ -336,7 +320,6 @@ router.put("/:id/cancel-by-rider", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// PUT /api/deliveries/:id/picked-up
 router.put("/:id/picked-up", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
@@ -356,10 +339,8 @@ router.put("/:id/picked-up", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// PUT /api/deliveries/:id/delivered
-// Rider taps "I've Delivered" → backend generates OTP → stores on delivery
-// OTP broadcast on order-specific channel — only that buyer gets it
-// Seller notified WITHOUT the OTP
+// Rider taps "I've Delivered" → backend generates OTP → buyer gets it
+// Seller notified WITHOUT OTP — security
 router.put("/:id/delivered", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
@@ -369,7 +350,6 @@ router.put("/:id/delivered", async (req, res) => {
     if (String(delivery.rider) !== String(riderId)) return res.status(403).json({ message: "Not your delivery." })
     if (delivery.status !== "picked_up") return res.status(400).json({ message: `Status is ${delivery.status}, must be picked_up.` })
 
-    // Generate OTP — stored on delivery, never sent to seller
     const otp             = crypto.randomInt(100000, 999999).toString()
     delivery.otp          = otp
     delivery.otpExpiresAt = new Date(Date.now() + 30 * 60 * 1000)
@@ -381,8 +361,7 @@ router.put("/:id/delivered", async (req, res) => {
 
     const io = req.app.get("io")
 
-    // Broadcast OTP on the order-specific channel — only the buyer holding
-    // that exact localOrderId receives it. Guest or logged-in, doesn't matter.
+    // Broadcast OTP on order-specific channel — only buyer with that localOrderId gets it
     if (io && delivery.localOrderId) {
       io.emit(`otp:${delivery.localOrderId}`, {
         otp,
@@ -393,7 +372,7 @@ router.put("/:id/delivered", async (req, res) => {
       })
     }
 
-    // Notify seller WITHOUT OTP — seller has no business seeing the OTP
+    // Notify seller WITHOUT OTP
     pushTo(req, String(delivery.seller), "delivery_at_door", {
       deliveryId: delivery._id.toString(),
       message:    "Package delivered. Waiting for buyer OTP confirmation.",
@@ -406,8 +385,8 @@ router.put("/:id/delivered", async (req, res) => {
   }
 })
 
-// PUT /api/deliveries/:id/confirm-otp
-// Rider enters OTP heard from buyer → verified → order COMPLETED
+// Rider submits OTP → verified → order COMPLETED
+// ── KEY: pushes sale_completed to SELLER and delivery_completed to BUYER ──────
 router.put("/:id/confirm-otp", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
@@ -434,17 +413,66 @@ router.put("/:id/confirm-otp", async (req, res) => {
       await rider.save()
     }
 
+    // Update order in DB and get the order details for seller notification
+    let orderAmount    = 0
+    let orderSellerId  = String(delivery.seller)
+    let platformFee    = 0
+    let sellerAmount   = 0
+
     if (delivery.order) {
-      try { await Order.findByIdAndUpdate(delivery.order, { status: "Completed" }) } catch {}
+      try {
+        const order = await Order.findByIdAndUpdate(
+          delivery.order,
+          { status: "Completed" },
+          { new: true }
+        )
+        if (order) {
+          orderAmount   = order.amount   || 0
+          platformFee   = order.platformFee || Math.round(orderAmount * 0.08)
+          sellerAmount  = order.sellerAmount || (orderAmount - platformFee)
+          orderSellerId = String(order.seller)
+        }
+      } catch (e) {
+        console.warn("Order update failed:", e.message)
+      }
     }
 
+    const io = req.app.get("io")
+
+    // ── Push sale_completed to SELLER (cross-device, queued if offline) ────────
+    // This makes the seller's dashboard update in real time
+    pushTo(req, orderSellerId, "sale_completed", {
+      deliveryId:   delivery._id.toString(),
+      localOrderId: delivery.localOrderId,
+      itemTitle:    delivery.itemTitle,
+      deliveryFee:  delivery.deliveryFee,
+      orderAmount,
+      platformFee,
+      sellerAmount,
+      message:      `Sale complete! ₵${sellerAmount} added to your earnings.`,
+    })
+
+    // ── Push delivery_completed to BUYER via order-specific channel ────────────
+    // Buyer's Checkout.jsx listens for `completed:${localOrderId}`
+    if (io && delivery.localOrderId) {
+      io.emit(`completed:${delivery.localOrderId}`, {
+        deliveryId:   delivery._id.toString(),
+        localOrderId: delivery.localOrderId,
+        itemTitle:    delivery.itemTitle,
+        message:      "Delivery confirmed! Thank you.",
+      })
+    }
+
+    // Also push delivery_completed to seller via the standard event
     pushTo(req, String(delivery.seller), "delivery_completed", {
       deliveryId:  delivery._id.toString(),
       deliveryFee: delivery.deliveryFee,
+      orderAmount,
+      sellerAmount,
       message:     "Delivery confirmed via OTP. Payment released.",
     })
 
-    console.log(`✅ Delivery ${delivery._id} completed | ₵${delivery.deliveryFee}`)
+    console.log(`✅ Delivery ${delivery._id} completed | ₵${delivery.deliveryFee} | seller gets ₵${sellerAmount}`)
     res.json({ delivery, message: "Delivery complete." })
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
