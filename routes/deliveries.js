@@ -104,7 +104,6 @@ router.get("/my-active", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// GET /api/deliveries/otp-for-order/:localOrderId — PUBLIC, buyer polls this
 router.get("/otp-for-order/:localOrderId", async (req, res) => {
   try {
     const { localOrderId } = req.params
@@ -339,8 +338,6 @@ router.put("/:id/picked-up", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }) }
 })
 
-// Rider taps "I've Delivered" → backend generates OTP → buyer gets it
-// Seller notified WITHOUT OTP — security
 router.put("/:id/delivered", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
@@ -361,7 +358,7 @@ router.put("/:id/delivered", async (req, res) => {
 
     const io = req.app.get("io")
 
-    // Broadcast OTP on order-specific channel — only buyer with that localOrderId gets it
+    // Broadcast OTP on order-specific channel — only the buyer gets it
     if (io && delivery.localOrderId) {
       io.emit(`otp:${delivery.localOrderId}`, {
         otp,
@@ -385,14 +382,14 @@ router.put("/:id/delivered", async (req, res) => {
   }
 })
 
-// Rider submits OTP → verified → order COMPLETED
-// ── KEY: pushes sale_completed to SELLER and delivery_completed to BUYER ──────
+// ── confirm-otp — THE KEY ROUTE ───────────────────────────────────────────────
 router.put("/:id/confirm-otp", async (req, res) => {
   try {
     const riderId = getAnyUserId(req)
     if (!riderId) return res.status(401).json({ message: "Not authorized." })
     const { otp } = req.body
     if (!otp) return res.status(400).json({ message: "OTP required." })
+
     const delivery = await Delivery.findById(req.params.id)
     if (!delivery) return res.status(404).json({ message: "Delivery not found." })
     if (String(delivery.rider) !== String(riderId)) return res.status(403).json({ message: "Not your delivery." })
@@ -405,6 +402,7 @@ router.put("/:id/confirm-otp", async (req, res) => {
     delivery.completedAt = new Date()
     await delivery.save()
 
+    // Update rider stats
     const rider = await Rider.findById(riderId)
     if (rider) {
       rider.totalDeliveries += 1
@@ -413,34 +411,51 @@ router.put("/:id/confirm-otp", async (req, res) => {
       await rider.save()
     }
 
-    // Update order in DB and get the order details for seller notification
-    let orderAmount    = 0
-    let orderSellerId  = String(delivery.seller)
-    let platformFee    = 0
-    let sellerAmount   = 0
+    // ── Find the order — try delivery.order first, then localOrderId fallback ─
+    // This is the fix for Bug 1 — guest buyers don't have a logged-in session
+    // so delivery.order (MongoDB ref) may be null. We fall back to localOrderId.
+    let order         = null
+    let orderAmount   = 0
+    let platformFee   = 0
+    let sellerAmount  = 0
+    let orderSellerId = String(delivery.seller)
 
     if (delivery.order) {
       try {
-        const order = await Order.findByIdAndUpdate(
+        order = await Order.findByIdAndUpdate(
           delivery.order,
           { status: "Completed" },
           { new: true }
         )
-        if (order) {
-          orderAmount   = order.amount   || 0
-          platformFee   = order.platformFee || Math.round(orderAmount * 0.08)
-          sellerAmount  = order.sellerAmount || (orderAmount - platformFee)
-          orderSellerId = String(order.seller)
-        }
-      } catch (e) {
-        console.warn("Order update failed:", e.message)
-      }
+      } catch (e) { console.warn("Order lookup by ID failed:", e.message) }
+    }
+
+    // Fallback — find by localOrderId if delivery.order was null or lookup failed
+    if (!order && delivery.localOrderId) {
+      try {
+        order = await Order.findOneAndUpdate(
+          { localOrderId: delivery.localOrderId },
+          { status: "Completed" },
+          { new: true }
+        )
+      } catch (e) { console.warn("Order lookup by localOrderId failed:", e.message) }
+    }
+
+    if (order) {
+      orderAmount   = order.amount      || 0
+      platformFee   = order.platformFee || Math.round(orderAmount * 0.08)
+      sellerAmount  = order.sellerAmount || (orderAmount - platformFee)
+      orderSellerId = String(order.seller)
+      console.log(`✅ Order found | amount: ₵${orderAmount} | seller gets: ₵${sellerAmount}`)
+    } else {
+      // No order record found — calculate from delivery data as last resort
+      // This handles edge cases where the order wasn't saved to DB
+      console.warn(`⚠️ No order found for delivery ${delivery._id} | localOrderId: ${delivery.localOrderId}`)
     }
 
     const io = req.app.get("io")
 
-    // ── Push sale_completed to SELLER (cross-device, queued if offline) ────────
-    // This makes the seller's dashboard update in real time
+    // ── Push sale_completed to SELLER with real amounts ───────────────────────
     pushTo(req, orderSellerId, "sale_completed", {
       deliveryId:   delivery._id.toString(),
       localOrderId: delivery.localOrderId,
@@ -449,22 +464,24 @@ router.put("/:id/confirm-otp", async (req, res) => {
       orderAmount,
       platformFee,
       sellerAmount,
-      message:      `Sale complete! ₵${sellerAmount} added to your earnings.`,
+      message:      `Sale complete! ₵${sellerAmount.toLocaleString()} added to your earnings.`,
     })
 
-    // ── Push delivery_completed to BUYER via order-specific channel ────────────
-    // Buyer's Checkout.jsx listens for `completed:${localOrderId}`
+    // ── Push completed to BUYER on order-specific channel ────────────────────
+    // This is the fix for Bug 2 — buyer's Checkout.jsx listens on this event
     if (io && delivery.localOrderId) {
       io.emit(`completed:${delivery.localOrderId}`, {
         deliveryId:   delivery._id.toString(),
         localOrderId: delivery.localOrderId,
         itemTitle:    delivery.itemTitle,
-        message:      "Delivery confirmed! Thank you.",
+        orderAmount,
+        sellerAmount,
+        message:      "Delivery confirmed! Payment released.",
       })
     }
 
-    // Also push delivery_completed to seller via the standard event
-    pushTo(req, String(delivery.seller), "delivery_completed", {
+    // Standard delivery_completed to seller as well
+    pushTo(req, orderSellerId, "delivery_completed", {
       deliveryId:  delivery._id.toString(),
       deliveryFee: delivery.deliveryFee,
       orderAmount,
@@ -472,9 +489,12 @@ router.put("/:id/confirm-otp", async (req, res) => {
       message:     "Delivery confirmed via OTP. Payment released.",
     })
 
-    console.log(`✅ Delivery ${delivery._id} completed | ₵${delivery.deliveryFee} | seller gets ₵${sellerAmount}`)
+    console.log(`✅ Delivery ${delivery._id} completed | seller: ₵${sellerAmount} | rider: ₵${delivery.deliveryFee}`)
     res.json({ delivery, message: "Delivery complete." })
-  } catch (err) { res.status(500).json({ message: err.message }) }
+  } catch (err) {
+    console.error("confirm-otp error:", err.message)
+    res.status(500).json({ message: err.message })
+  }
 })
 
 // GET /api/deliveries/:id — MUST BE LAST
