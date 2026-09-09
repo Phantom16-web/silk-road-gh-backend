@@ -28,7 +28,7 @@ function pushToSeller(req, sellerId, data) {
   }
 }
 
-// @route POST /api/orders — PUBLIC
+// POST /api/orders — PUBLIC (guests can order)
 router.post("/", async (req, res) => {
   try {
     const {
@@ -74,6 +74,7 @@ router.post("/", async (req, res) => {
     const platformFee  = Math.round((amount || 0) * 0.08)
     const sellerAmount = (amount || 0) - platformFee
 
+    // Attach buyer if a valid token is present — never block if missing
     let buyerId = null
     try {
       const header = req.headers.authorization
@@ -106,6 +107,7 @@ router.post("/", async (req, res) => {
       status:         "In Escrow",
     })
 
+    // Push real-time notification to seller (queued if offline)
     pushToSeller(req, resolvedSellerId, {
       orderId:        localOrderId     || String(order._id),
       itemTitle:      listingTitle,
@@ -122,7 +124,7 @@ router.post("/", async (req, res) => {
       promoCode:      promoCode        || null,
     })
 
-    console.log(`✅ Order ${order._id} | seller: ${resolvedSellerId} | ₵${amount} | ${deliveryMethod || "pickup"}`)
+    console.log(`✅ Order ${order._id} | localOrderId: ${localOrderId} | seller: ${resolvedSellerId} | ₵${amount}`)
     res.status(201).json({ orderId: String(order._id), order })
   } catch (err) {
     console.error("Create order error:", err.message)
@@ -130,49 +132,7 @@ router.post("/", async (req, res) => {
   }
 })
 
-// @route GET /api/orders/track/:localOrderId — PUBLIC
-// Lets any device look up an order by SR-XXXXX even if localStorage is empty
-router.get("/track/:localOrderId", async (req, res) => {
-  try {
-    const { localOrderId } = req.params
-    if (!localOrderId) return res.status(400).json({ message: "Order ID required." })
-
-    const order = await Order.findOne({ localOrderId })
-      .populate("listing", "title image category")
-      .populate("seller",  "name university")
-
-    if (!order) return res.status(404).json({ message: "Order not found." })
-
-    // Return only the fields the buyer needs — no sensitive seller data
-    res.json({
-      id:             order.localOrderId,
-      backendOrderId: String(order._id),
-      status:         order.status,
-      amount:         order.amount,
-      deliveryMethod: order.deliveryMethod,
-      paymentMethod:  order.paymentMethod,
-      location:       order.location,
-      landmark:       order.landmark,
-      extraInfo:      order.extraInfo,
-      payerName:      order.payerName,
-      itemTitle:      order.listing?.title  || "Item",
-      itemImage:      order.listing?.image  || null,
-      category:       order.listing?.category || null,
-      sellerName:     order.seller?.name    || null,
-      sellerUni:      order.seller?.university || null,
-      promoCode:      order.promoCode,
-      discount:       order.discount,
-      createdAt:      order.createdAt,
-      delivered:      order.status === "Completed" ? true
-                    : order.status === "Refunded"  ? false
-                    : null,
-    })
-  } catch (err) {
-    res.status(500).json({ message: err.message })
-  }
-})
-
-// @route GET /api/orders/my
+// GET /api/orders/my
 router.get("/my", protect, async (req, res) => {
   try {
     const orders = await Order.find({ buyer: req.user.id })
@@ -185,7 +145,7 @@ router.get("/my", protect, async (req, res) => {
   }
 })
 
-// @route GET /api/orders/selling
+// GET /api/orders/selling
 router.get("/selling", protect, async (req, res) => {
   try {
     const orders = await Order.find({ seller: req.user.id })
@@ -198,7 +158,7 @@ router.get("/selling", protect, async (req, res) => {
   }
 })
 
-// @route GET /api/orders/all — admin
+// GET /api/orders/all — admin
 router.get("/all", protect, async (req, res) => {
   try {
     const orders = await Order.find()
@@ -212,7 +172,39 @@ router.get("/all", protect, async (req, res) => {
   }
 })
 
-// @route PUT /api/orders/confirm-by-ref — MUST be before /:id
+// GET /api/orders/by-local-id/:localOrderId — PUBLIC
+// Used by Order Tracker when localStorage is wiped (incognito, tab close, etc.)
+router.get("/by-local-id/:localOrderId", async (req, res) => {
+  try {
+    const { localOrderId } = req.params
+    if (!localOrderId) return res.status(400).json({ message: "ID required." })
+
+    const order = await Order.findOne({ localOrderId })
+      .populate("listing", "title image")
+      .populate("seller",  "name")
+
+    if (!order) return res.status(404).json({ message: "Order not found." })
+
+    res.json({
+      _id:            order._id.toString(),
+      localOrderId:   order.localOrderId,
+      amount:         order.amount,
+      status:         order.status,
+      deliveryMethod: order.deliveryMethod,
+      location:       order.location,
+      landmark:       order.landmark,
+      payerName:      order.payerName,
+      paystackRef:    order.paystackRef,
+      createdAt:      order.createdAt,
+      listing:        order.listing,
+      seller:         order.seller,
+    })
+  } catch (err) {
+    res.status(500).json({ message: err.message })
+  }
+})
+
+// PUT /api/orders/confirm-by-ref — MUST be before /:id
 router.put("/confirm-by-ref", protect, async (req, res) => {
   try {
     const { paystackRef } = req.body
@@ -227,7 +219,7 @@ router.put("/confirm-by-ref", protect, async (req, res) => {
   }
 })
 
-// @route PUT /api/orders/:id/confirm-delivery
+// PUT /api/orders/:id/confirm-delivery
 router.put("/:id/confirm-delivery", protect, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id)
@@ -240,7 +232,7 @@ router.put("/:id/confirm-delivery", protect, async (req, res) => {
   }
 })
 
-// @route PUT /api/orders/:id/cancel
+// PUT /api/orders/:id/cancel
 router.put("/:id/cancel", protect, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id)
@@ -254,7 +246,7 @@ router.put("/:id/cancel", protect, async (req, res) => {
   }
 })
 
-// @route PUT /api/orders/:id/confirm-return
+// PUT /api/orders/:id/confirm-return
 router.put("/:id/confirm-return", protect, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id)
