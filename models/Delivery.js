@@ -1,78 +1,270 @@
 import mongoose from "mongoose"
 
-const deliverySchema = new mongoose.Schema({
-  order: {
-    type:     mongoose.Schema.Types.ObjectId,
-    ref:      "Order",
-    required: false,   // guest buyers have no backend order ID
-    default:  null,
-  },
-  seller: {
-    type:     mongoose.Schema.Types.ObjectId,
-    ref:      "User",
-    required: true,
-  },
-  buyer: {
-    type:     mongoose.Schema.Types.ObjectId,
-    ref:      "User",
-    default:  null,
-  },
-  rider: {
-    type:    mongoose.Schema.Types.ObjectId,
-    ref:     "Rider",
-    default: null,
-  },
+const deliverySchema =
+  new mongoose.Schema(
+    {
+      // ─────────────────────────────────────────────────────────────────────
+      // ORDER
+      // ─────────────────────────────────────────────────────────────────────
 
-  pickupLocation: {
-    lat:     { type: Number, required: true },
-    lng:     { type: Number, required: true },
-    address: { type: String, default: "" },
-  },
-  dropLocation: {
-    lat:     { type: Number, required: true },
-    lng:     { type: Number, required: true },
-    address: { type: String, default: "" },
-  },
+      order: {
+        type:
+          mongoose.Schema.Types.ObjectId,
 
-  sellerContact: { type: String, default: "" },
-  buyerContact:  { type: String, default: "" },
+        ref: "Order",
 
-  distanceKm:  { type: Number, required: true },
-  deliveryFee: { type: Number, required: true },
+        required: false,
 
-  // OTP generated when rider/seller marks as delivered
-  // Buyer sees this on their screen and reads it to the deliverer
-  otp:          { type: String,  default: null },
-  otpExpiresAt: { type: Date,    default: null },
-  otpVerified:  { type: Boolean, default: false },
+        default: null,
 
-  // Status flow:
-  // pending → accepted → picked_up → delivered → completed
-  // pending → cancelled
-  status: {
-    type:    String,
-    enum:    ["pending", "accepted", "picked_up", "delivered", "completed", "declined", "cancelled"],
-    default: "pending",
-  },
+        index: true,
+      },
 
-  acceptedAt:  { type: Date, default: null },
-  pickedUpAt:  { type: Date, default: null },
-  deliveredAt: { type: Date, default: null },
-  completedAt: { type: Date, default: null },
+      localOrderId: {
+        type: String,
 
-  deliveryType: {
-    type:    String,
-    enum:    ["rider", "self"],
-    default: "rider",
-  },
+        default: null,
 
-  itemTitle: { type: String, default: "" },
-  itemImage: { type: String, default: "" },
-  notes:     { type: String, default: "" },
+        index: true,
+      },
 
-  // Store the local SR- order ID for reference when no MongoDB order exists
-  localOrderId: { type: String, default: null },
+      // ─────────────────────────────────────────────────────────────────────
+      // PARTIES
+      // ─────────────────────────────────────────────────────────────────────
 
-}, { timestamps: true })
+      seller: {
+        type:
+          mongoose.Schema.Types.ObjectId,
 
-export default mongoose.model("Delivery", deliverySchema)
+        ref: "User",
+
+        required: true,
+
+        index: true,
+      },
+
+      buyer: {
+        type:
+          mongoose.Schema.Types.ObjectId,
+
+        ref: "User",
+
+        default: null,
+
+        index: true,
+      },
+
+      rider: {
+        type:
+          mongoose.Schema.Types.ObjectId,
+
+        ref: "Rider",
+
+        default: null,
+
+        index: true,
+      },
+
+      // ─────────────────────────────────────────────────────────────────────
+      // LOCATIONS
+      // ─────────────────────────────────────────────────────────────────────
+
+      pickupLocation: {
+        lat: {
+          type: Number,
+          required: true,
+        },
+
+        lng: {
+          type: Number,
+          required: true,
+        },
+
+        address: {
+          type: String,
+          default: "",
+        },
+      },
+
+      dropLocation: {
+        lat: {
+          type: Number,
+          required: true,
+        },
+
+        lng: {
+          type: Number,
+          required: true,
+        },
+
+        address: {
+          type: String,
+          default: "",
+        },
+      },
+
+      // ─────────────────────────────────────────────────────────────────────
+      // CONTACT
+      // ─────────────────────────────────────────────────────────────────────
+
+      sellerContact: {
+        type: String,
+        default: "",
+      },
+
+      buyerContact: {
+        type: String,
+        default: "",
+      },
+
+      // ─────────────────────────────────────────────────────────────────────
+      // DELIVERY MONEY
+      // ─────────────────────────────────────────────────────────────────────
+
+      distanceKm: {
+        type: Number,
+        required: true,
+        min: 0,
+      },
+
+      deliveryFee: {
+        type: Number,
+        required: true,
+        min: 0,
+      },
+
+      // ─────────────────────────────────────────────────────────────────────
+      // OTP
+      // ─────────────────────────────────────────────────────────────────────
+
+      otp: {
+        type: String,
+        default: null,
+      },
+
+      otpExpiresAt: {
+        type: Date,
+        default: null,
+      },
+
+      otpVerified: {
+        type: Boolean,
+        default: false,
+      },
+
+      otpAttempts: {
+        type: Number,
+        default: 0,
+      },
+
+      // Prevent unlimited guessing.
+      otpLocked: {
+        type: Boolean,
+        default: false,
+      },
+
+      // ─────────────────────────────────────────────────────────────────────
+      // STATUS
+      // ─────────────────────────────────────────────────────────────────────
+
+      status: {
+        type: String,
+
+        enum: [
+          "pending",
+          "accepted",
+          "picked_up",
+          "delivered",
+          "completed",
+          "declined",
+          "cancelled",
+        ],
+
+        default: "pending",
+
+        index: true,
+      },
+
+      // ─────────────────────────────────────────────────────────────────────
+      // TIMESTAMPS
+      // ─────────────────────────────────────────────────────────────────────
+
+      acceptedAt: {
+        type: Date,
+        default: null,
+      },
+
+      pickedUpAt: {
+        type: Date,
+        default: null,
+      },
+
+      deliveredAt: {
+        type: Date,
+        default: null,
+      },
+
+      completedAt: {
+        type: Date,
+        default: null,
+      },
+
+      // ─────────────────────────────────────────────────────────────────────
+      // DELIVERY TYPE
+      // ─────────────────────────────────────────────────────────────────────
+
+      deliveryType: {
+        type: String,
+
+        enum: [
+          "rider",
+          "self",
+        ],
+
+        default: "rider",
+      },
+
+      // ─────────────────────────────────────────────────────────────────────
+      // ITEM DISPLAY
+      // ─────────────────────────────────────────────────────────────────────
+
+      itemTitle: {
+        type: String,
+        default: "",
+      },
+
+      itemImage: {
+        type: String,
+        default: "",
+      },
+
+      notes: {
+        type: String,
+        default: "",
+      },
+    },
+
+    {
+      timestamps: true,
+    }
+  )
+
+deliverySchema.index({
+  seller: 1,
+  status: 1,
+})
+
+deliverySchema.index({
+  rider: 1,
+  status: 1,
+})
+
+deliverySchema.index({
+  localOrderId: 1,
+})
+
+export default mongoose.models.Delivery ||
+  mongoose.model(
+    "Delivery",
+    deliverySchema
+  )
