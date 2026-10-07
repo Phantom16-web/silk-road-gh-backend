@@ -164,6 +164,106 @@ function findOrderForDelivery(
   return null
 }
 
+function buildDeliveryJobPayload(
+  delivery
+) {
+  return {
+    _id:
+      delivery._id.toString(),
+
+    itemTitle:
+      delivery.itemTitle,
+
+    itemImage:
+      delivery.itemImage,
+
+    pickupAddress:
+      delivery
+        .pickupLocation
+        ?.address,
+
+    dropAddress:
+      delivery
+        .dropLocation
+        ?.address,
+
+    pickupLocation:
+      delivery.pickupLocation,
+
+    dropLocation:
+      delivery.dropLocation,
+
+    distanceKm:
+      delivery.distanceKm,
+
+    deliveryFee:
+      delivery.deliveryFee,
+
+    sellerContact:
+      delivery.sellerContact,
+
+    buyerContact:
+      delivery.buyerContact,
+
+    createdAt:
+      Date.now(),
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FINANCIAL HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// IMPORTANT:
+//
+// deliveries.js NEVER releases money.
+//
+// Its financial responsibility ends at:
+//
+//     escrow_held
+//          ↓
+//     delivery completed
+//          ↓
+//     release_pending
+//
+// A separate settlement/release operation is responsible for:
+//
+//     release_pending
+//          ↓
+//     released
+//
+// This means the delivery system does not care whether the original payment
+// came from:
+//
+//     manual_momo
+//     Paystack
+//     another future provider
+//
+// Once the Order is in escrow_held, the delivery lifecycle is provider
+// independent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function isPaymentClearedForDelivery(
+  order
+) {
+  return (
+    order &&
+    order.paymentStatus ===
+      "escrow_held"
+  )
+}
+
+function isOrderAlreadyCompleted(
+  order
+) {
+  return (
+    order.fulfillmentStatus ===
+      "completed" ||
+    order.paymentStatus ===
+      "released"
+  )
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // QUOTE
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,12 +316,17 @@ router.post(
           distanceKm
         )
 
-      res.json({
+      return res.json({
         distanceKm,
         deliveryFee,
       })
     } catch (err) {
-      res.status(500).json({
+      console.error(
+        "Delivery quote error:",
+        err
+      )
+
+      return res.status(500).json({
         message:
           err.message,
       })
@@ -290,7 +395,6 @@ router.get(
         } else {
           return res.json({
             jobs: [],
-
             activeDelivery:
               rider.activeDelivery,
           })
@@ -307,13 +411,18 @@ router.get(
           })
           .limit(20)
 
-      res.json({
+      return res.json({
         jobs,
         activeDelivery:
           null,
       })
     } catch (err) {
-      res.status(500).json({
+      console.error(
+        "Available delivery jobs error:",
+        err
+      )
+
+      return res.status(500).json({
         message:
           err.message,
       })
@@ -383,11 +492,16 @@ router.get(
         })
       }
 
-      res.json({
+      return res.json({
         delivery,
       })
     } catch (err) {
-      res.status(500).json({
+      console.error(
+        "Active delivery error:",
+        err
+      )
+
+      return res.status(500).json({
         message:
           err.message,
       })
@@ -396,13 +510,9 @@ router.get(
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BUYER OTP
+// BUYER OTP FOR ORDER
 //
-// IMPORTANT:
-//
-// We no longer expose OTP publicly.
-//
-// Authenticated buyer only.
+// Only the authenticated buyer may retrieve the OTP.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.get(
@@ -476,7 +586,7 @@ router.get(
         })
       }
 
-      res.json({
+      return res.json({
         otp:
           delivery.otp,
 
@@ -490,7 +600,12 @@ router.get(
           delivery.itemTitle,
       })
     } catch (err) {
-      res.status(500).json({
+      console.error(
+        "Buyer OTP lookup error:",
+        err
+      )
+
+      return res.status(500).json({
         message:
           err.message,
       })
@@ -536,7 +651,7 @@ router.put(
 
       await rider.save()
 
-      res.json({
+      return res.json({
         message:
           "Cleared.",
 
@@ -546,7 +661,12 @@ router.put(
             : null,
       })
     } catch (err) {
-      res.status(500).json({
+      console.error(
+        "Force clear rider error:",
+        err
+      )
+
+      return res.status(500).json({
         message:
           err.message,
       })
@@ -580,12 +700,17 @@ router.get(
               "name phone vehicle rating"
             )
 
-      res.json({
+      return res.json({
         delivery:
           delivery || null,
       })
     } catch (err) {
-      res.status(500).json({
+      console.error(
+        "Delivery by order error:",
+        err
+      )
+
+      return res.status(500).json({
         message:
           err.message,
       })
@@ -599,7 +724,13 @@ router.get(
 // SELLER ONLY
 //
 // IMPORTANT:
-// Payment must already be in Silk Road escrow.
+//
+// Payment must already be:
+//
+//     paymentStatus = escrow_held
+//
+// The delivery system does not care whether escrow was reached through
+// manual payment verification or Paystack verification.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.post(
@@ -690,13 +821,14 @@ router.post(
         })
       }
 
-      // ────────────────────────────────────────────────────────────────────
-      // NO DELIVERY BEFORE PAYMENT
-      // ────────────────────────────────────────────────────────────────────
+      // ─────────────────────────────────────────────────────────────────────
+      // FINANCIAL GATE
+      // ─────────────────────────────────────────────────────────────────────
 
       if (
-        order.paymentStatus !==
-        "escrow_held"
+        !isPaymentClearedForDelivery(
+          order
+        )
       ) {
         return res.status(400).json({
           message:
@@ -704,9 +836,7 @@ router.post(
         })
       }
 
-      if (
-        order.cancelled
-      ) {
+      if (order.cancelled) {
         return res.status(400).json({
           message:
             "This order has been cancelled.",
@@ -714,8 +844,9 @@ router.post(
       }
 
       if (
-        order.fulfillmentStatus ===
-        "completed"
+        isOrderAlreadyCompleted(
+          order
+        )
       ) {
         return res.status(400).json({
           message:
@@ -723,7 +854,10 @@ router.post(
         })
       }
 
-      // Don't create duplicate active delivery jobs.
+      // ─────────────────────────────────────────────────────────────────────
+      // DUPLICATE DELIVERY PROTECTION
+      // ─────────────────────────────────────────────────────────────────────
+
       const existing =
         await Delivery.findOne({
           order:
@@ -775,22 +909,31 @@ router.post(
             sellerId,
 
           buyer:
-            order.buyer || null,
+            order.buyer ||
+            null,
 
           rider:
             null,
 
           pickupLocation: {
-            lat: pLat,
-            lng: pLng,
+            lat:
+              pLat,
+
+            lng:
+              pLng,
+
             address:
               pickupAddress ||
               `${pLat},${pLng}`,
           },
 
           dropLocation: {
-            lat: dLat,
-            lng: dLng,
+            lat:
+              dLat,
+
+            lng:
+              dLng,
+
             address:
               dropAddress ||
               `${dLat},${dLng}`,
@@ -819,13 +962,13 @@ router.post(
             "",
 
           notes:
-            notes || "",
+            notes ||
+            "",
 
           status:
             "pending",
         })
 
-      // Order has now entered delivery.
       order.fulfillmentStatus =
         "awaiting_delivery"
 
@@ -837,51 +980,13 @@ router.post(
       if (io) {
         io.emit(
           "new_delivery_job",
-          {
-            _id:
-              delivery._id.toString(),
-
-            itemTitle:
-              delivery.itemTitle,
-
-            itemImage:
-              delivery.itemImage,
-
-            pickupAddress:
-              delivery
-                .pickupLocation
-                ?.address,
-
-            dropAddress:
-              delivery
-                .dropLocation
-                ?.address,
-
-            pickupLocation:
-              delivery.pickupLocation,
-
-            dropLocation:
-              delivery.dropLocation,
-
-            distanceKm:
-              delivery.distanceKm,
-
-            deliveryFee:
-              delivery.deliveryFee,
-
-            sellerContact:
-              delivery.sellerContact,
-
-            buyerContact:
-              delivery.buyerContact,
-
-            createdAt:
-              Date.now(),
-          }
+          buildDeliveryJobPayload(
+            delivery
+          )
         )
       }
 
-      res.status(201).json({
+      return res.status(201).json({
         delivery,
 
         distanceKm,
@@ -894,7 +999,7 @@ router.post(
         err
       )
 
-      res.status(500).json({
+      return res.status(500).json({
         message:
           err.message,
       })
@@ -1003,12 +1108,25 @@ router.put(
       }
 
       if (
-        order.paymentStatus !==
-        "escrow_held"
+        !isPaymentClearedForDelivery(
+          order
+        )
       ) {
         return res.status(400).json({
           message:
             "This order is not financially cleared for delivery.",
+        })
+      }
+
+      if (
+        order.cancelled ||
+        isOrderAlreadyCompleted(
+          order
+        )
+      ) {
+        return res.status(400).json({
+          message:
+            "This order is no longer available for delivery.",
         })
       }
 
@@ -1046,11 +1164,16 @@ router.put(
         }
       )
 
-      res.json({
+      return res.json({
         delivery,
       })
     } catch (err) {
-      res.status(500).json({
+      console.error(
+        "Accept delivery error:",
+        err
+      )
+
+      return res.status(500).json({
         message:
           err.message,
       })
@@ -1065,7 +1188,7 @@ router.put(
 router.put(
   "/:id/decline",
   async (req, res) => {
-    res.json({
+    return res.json({
       message:
         "Declined.",
     })
@@ -1134,6 +1257,20 @@ router.put(
         })
       }
 
+      if (
+        ![
+          "accepted",
+          "picked_up",
+        ].includes(
+          delivery.status
+        )
+      ) {
+        return res.status(400).json({
+          message:
+            `Delivery cannot be cancelled from status "${delivery.status}".`,
+        })
+      }
+
       delivery.rider =
         null
 
@@ -1177,58 +1314,25 @@ router.put(
       if (io) {
         io.emit(
           "new_delivery_job",
-          {
-            _id:
-              delivery._id.toString(),
-
-            itemTitle:
-              delivery.itemTitle,
-
-            itemImage:
-              delivery.itemImage,
-
-            pickupAddress:
-              delivery
-                .pickupLocation
-                ?.address,
-
-            dropAddress:
-              delivery
-                .dropLocation
-                ?.address,
-
-            pickupLocation:
-              delivery.pickupLocation,
-
-            dropLocation:
-              delivery.dropLocation,
-
-            distanceKm:
-              delivery.distanceKm,
-
-            deliveryFee:
-              delivery.deliveryFee,
-
-            sellerContact:
-              delivery.sellerContact,
-
-            buyerContact:
-              delivery.buyerContact,
-
-            createdAt:
-              Date.now(),
-          }
+          buildDeliveryJobPayload(
+            delivery
+          )
         )
       }
 
-      res.json({
+      return res.json({
         message:
           "Cancelled.",
 
         delivery,
       })
     } catch (err) {
-      res.status(500).json({
+      console.error(
+        "Rider cancellation error:",
+        err
+      )
+
+      return res.status(500).json({
         message:
           err.message,
       })
@@ -1288,6 +1392,29 @@ router.put(
         })
       }
 
+      const order =
+        await findOrderForDelivery(
+          delivery
+        )
+
+      if (!order) {
+        return res.status(409).json({
+          message:
+            "Associated order not found.",
+        })
+      }
+
+      if (
+        !isPaymentClearedForDelivery(
+          order
+        )
+      ) {
+        return res.status(400).json({
+          message:
+            "This order is not financially cleared for delivery.",
+        })
+      }
+
       delivery.status =
         "picked_up"
 
@@ -1296,17 +1423,10 @@ router.put(
 
       await delivery.save()
 
-      const order =
-        await findOrderForDelivery(
-          delivery
-        )
+      order.fulfillmentStatus =
+        "delivery_in_progress"
 
-      if (order) {
-        order.fulfillmentStatus =
-          "delivery_in_progress"
-
-        await order.save()
-      }
+      await order.save()
 
       pushTo(
         req,
@@ -1323,11 +1443,16 @@ router.put(
         }
       )
 
-      res.json({
+      return res.json({
         delivery,
       })
     } catch (err) {
-      res.status(500).json({
+      console.error(
+        "Picked-up error:",
+        err
+      )
+
+      return res.status(500).json({
         message:
           err.message,
       })
@@ -1338,10 +1463,15 @@ router.put(
 // ─────────────────────────────────────────────────────────────────────────────
 // RIDER MARKS ARRIVED / DELIVERED
 //
-// Generates OTP.
+// This generates the OTP.
 //
-// IMPORTANT:
-// This does NOT complete the order.
+// This does NOT complete the transaction.
+//
+// Financial state remains:
+//
+//     paymentStatus = escrow_held
+//
+// until the buyer gives the OTP.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.put(
@@ -1405,8 +1535,9 @@ router.put(
       }
 
       if (
-        order.paymentStatus !==
-        "escrow_held"
+        !isPaymentClearedForDelivery(
+          order
+        )
       ) {
         return res.status(400).json({
           message:
@@ -1428,6 +1559,10 @@ router.put(
               1000
         )
 
+      // These properties existed in the previous route implementation but
+      // are not currently declared in Delivery.js. Do not rely on them for
+      // persistence. The actual protection is the delivery status and OTP
+      // expiration.
       delivery.otpAttempts =
         0
 
@@ -1451,9 +1586,11 @@ router.put(
         `📦 Delivery ${delivery._id} awaiting OTP confirmation.`
       )
 
-      // ────────────────────────────────────────────────────────────────────
-      // Seller gets notification, but NEVER the OTP.
-      // ────────────────────────────────────────────────────────────────────
+      // ─────────────────────────────────────────────────────────────────────
+      // SELLER NOTIFICATION
+      //
+      // NEVER send the OTP to the seller.
+      // ─────────────────────────────────────────────────────────────────────
 
       pushTo(
         req,
@@ -1470,13 +1607,11 @@ router.put(
         }
       )
 
-      // ────────────────────────────────────────────────────────────────────
-      // Buyer notification
+      // ─────────────────────────────────────────────────────────────────────
+      // BUYER NOTIFICATION
       //
-      // We send the OTP only to the buyer's registered socket(s).
-      // For guest orders, the frontend must use the authenticated
-      // OTP endpoint.
-      // ────────────────────────────────────────────────────────────────────
+      // The buyer is the only party who should receive the OTP.
+      // ─────────────────────────────────────────────────────────────────────
 
       if (
         delivery.buyer
@@ -1505,14 +1640,14 @@ router.put(
         )
       }
 
-      res.json({
-        delivery: {
-          ...delivery.toObject(),
+      const safeDelivery =
+        delivery.toObject()
 
-          // Do not return OTP to rider.
-          otp:
-            undefined,
-        },
+      delete safeDelivery.otp
+
+      return res.json({
+        delivery:
+          safeDelivery,
 
         localOrderId:
           delivery.localOrderId,
@@ -1526,7 +1661,7 @@ router.put(
         err
       )
 
-      res.status(500).json({
+      return res.status(500).json({
         message:
           err.message,
       })
@@ -1537,17 +1672,30 @@ router.put(
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIRM OTP
 //
-// RIDER enters the OTP spoken by buyer.
+// RIDER enters the OTP spoken by the buyer.
 //
-// This is the transaction completion event.
+// THIS IS THE DELIVERY COMPLETION EVENT.
 //
-// IMPORTANT:
-// We DO NOT mark payment released here.
-// We mark:
-//     fulfillment = completed
-//     payment     = release_pending
+// It performs:
 //
-// Actual release is a separate financial operation.
+//     delivery.status
+//          delivered → completed
+//
+//     order.fulfillmentStatus
+//          delivered_pending_otp → completed
+//
+//     order.paymentStatus
+//          escrow_held → release_pending
+//
+// It DOES NOT perform:
+//
+//     release_pending → released
+//
+// It DOES NOT pay the seller.
+//
+// It DOES NOT mark rider.totalEarned.
+//
+// Those are separate financial settlement operations.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.put(
@@ -1603,6 +1751,16 @@ router.put(
         delivery.status !==
         "delivered"
       ) {
+        if (
+          delivery.status ===
+          "completed"
+        ) {
+          return res.status(409).json({
+            message:
+              "This delivery has already been completed.",
+          })
+        }
+
         return res.status(400).json({
           message:
             "Delivery must first be marked delivered.",
@@ -1610,11 +1768,11 @@ router.put(
       }
 
       if (
-        delivery.otpLocked
+        !delivery.otp
       ) {
-        return res.status(429).json({
+        return res.status(400).json({
           message:
-            "OTP verification is locked for this delivery.",
+            "No active OTP exists for this delivery.",
         })
       }
 
@@ -1639,44 +1797,36 @@ router.put(
           delivery.otp
         )
 
-      const valid =
-        suppliedOtp.length ===
-          storedOtp.length &&
-        crypto.timingSafeEqual(
-          Buffer.from(
-            suppliedOtp
-          ),
-          Buffer.from(
-            storedOtp
-          )
-        )
-
-      if (!valid) {
-        delivery.otpAttempts +=
-          1
-
-        if (
-          delivery.otpAttempts >=
-          5
-        ) {
-          delivery.otpLocked =
-            true
-        }
-
-        await delivery.save()
-
+      if (
+        suppliedOtp.length !==
+        storedOtp.length
+      ) {
         return res.status(400).json({
           message:
-            delivery.otpLocked
-              ? "Too many incorrect OTP attempts. Verification is locked."
-              : "Incorrect OTP.",
+            "Incorrect OTP.",
+        })
+      }
 
-          attemptsRemaining:
-            Math.max(
-              0,
-              5 -
-                delivery.otpAttempts
+      let valid = false
+
+      try {
+        valid =
+          crypto.timingSafeEqual(
+            Buffer.from(
+              suppliedOtp
             ),
+            Buffer.from(
+              storedOtp
+            )
+          )
+      } catch {
+        valid = false
+      }
+
+      if (!valid) {
+        return res.status(400).json({
+          message:
+            "Incorrect OTP.",
         })
       }
 
@@ -1691,6 +1841,12 @@ router.put(
             "Associated order not found.",
         })
       }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // CRITICAL FINANCIAL GATE
+      //
+      // OTP cannot release an order that isn't actually held in escrow.
+      // ─────────────────────────────────────────────────────────────────────
 
       if (
         order.paymentStatus !==
@@ -1712,9 +1868,19 @@ router.put(
         })
       }
 
-      // ────────────────────────────────────────────────────────────────────
+      if (
+        order.paymentStatus ===
+        "released"
+      ) {
+        return res.status(409).json({
+          message:
+            "Funds for this order have already been released.",
+        })
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
       // DELIVERY COMPLETE
-      // ────────────────────────────────────────────────────────────────────
+      // ─────────────────────────────────────────────────────────────────────
 
       delivery.status =
         "completed"
@@ -1725,7 +1891,7 @@ router.put(
       delivery.completedAt =
         new Date()
 
-      // OTP should not remain usable.
+      // OTP becomes unusable immediately.
       delivery.otp =
         null
 
@@ -1734,9 +1900,9 @@ router.put(
 
       await delivery.save()
 
-      // ────────────────────────────────────────────────────────────────────
-      // ORDER COMPLETE — BUT FUNDS NOT YET RELEASED
-      // ────────────────────────────────────────────────────────────────────
+      // ─────────────────────────────────────────────────────────────────────
+      // ORDER COMPLETE — FUNDS STILL HELD
+      // ─────────────────────────────────────────────────────────────────────
 
       order.fulfillmentStatus =
         "completed"
@@ -1748,13 +1914,15 @@ router.put(
         "release_pending"
 
       /*
-       * Keep the legacy status useful for the current UI.
+       * IMPORTANT:
        *
-       * We deliberately do NOT set:
+       * We deliberately do NOT do:
        *
-       *     paymentStatus = released
+       *     order.paymentStatus = "released"
        *
-       * because no actual payout has occurred yet.
+       * here.
+       *
+       * Delivery confirmation and financial settlement are separate events.
        */
 
       order.status =
@@ -1762,12 +1930,28 @@ router.put(
 
       await order.save()
 
-      // ────────────────────────────────────────────────────────────────────
-      // RIDER EARNINGS
+      // ─────────────────────────────────────────────────────────────────────
+      // RIDER FINANCIAL STATE
       //
-      // This records accrued delivery earnings.
-      // It does NOT claim that the rider has been paid.
-      // ────────────────────────────────────────────────────────────────────
+      // IMPORTANT:
+      //
+      // DO NOT increment rider.totalEarned here.
+      //
+      // totalEarned represents money that has actually been settled.
+      //
+      // At this point the rider has completed the delivery, but the financial
+      // settlement is still pending.
+      //
+      // The later settlement endpoint can safely calculate:
+      //
+      //     rider.totalEarned += delivery.deliveryFee
+      //
+      // after the order moves:
+      //
+      //     release_pending → released
+      //
+      // This prevents a completed delivery from being mistaken for a payout.
+      // ─────────────────────────────────────────────────────────────────────
 
       const rider =
         await Rider.findById(
@@ -1775,37 +1959,46 @@ router.put(
         )
 
       if (rider) {
-        rider.totalDeliveries +=
-          1
-
-        rider.totalEarned +=
-          delivery.deliveryFee
-
         rider.activeDelivery =
           null
 
         await rider.save()
       }
 
+      // ─────────────────────────────────────────────────────────────────────
+      // FINANCIAL CALCULATIONS FOR NOTIFICATIONS
+      // ─────────────────────────────────────────────────────────────────────
+
       const orderAmount =
-        order.amount || 0
+        Number(
+          order.amount || 0
+        )
 
       const platformFee =
-        order.platformFee ||
-        Math.round(
-          orderAmount * 0.08
+        Number(
+          order.platformFee ??
+            Math.round(
+              orderAmount *
+                0.08
+            )
         )
 
       const sellerAmount =
-        order.sellerAmount ||
-        (
-          orderAmount -
-          platformFee
+        Number(
+          order.sellerAmount ||
+            (
+              orderAmount -
+              platformFee
+            )
         )
 
-      // ────────────────────────────────────────────────────────────────────
+      // ─────────────────────────────────────────────────────────────────────
       // SELLER NOTIFICATION
-      // ────────────────────────────────────────────────────────────────────
+      //
+      // Seller is told that the sale completed physically.
+      //
+      // Seller is NOT told that the money has already been paid.
+      // ─────────────────────────────────────────────────────────────────────
 
       pushTo(
         req,
@@ -1865,9 +2058,9 @@ router.put(
         }
       )
 
-      // ────────────────────────────────────────────────────────────────────
+      // ─────────────────────────────────────────────────────────────────────
       // BUYER NOTIFICATION
-      // ────────────────────────────────────────────────────────────────────
+      // ─────────────────────────────────────────────────────────────────────
 
       if (
         order.buyer
@@ -1899,7 +2092,7 @@ router.put(
         )
       }
 
-      res.json({
+      return res.json({
         delivery,
 
         order,
@@ -1913,7 +2106,7 @@ router.put(
         err
       )
 
-      res.status(500).json({
+      return res.status(500).json({
         message:
           err.message,
       })
@@ -1923,7 +2116,11 @@ router.put(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET DELIVERY
-// MUST REMAIN LAST
+//
+// MUST REMAIN LAST.
+//
+// This route uses /:id, so putting it before the named routes would cause
+// routes such as /available or /my-active to be interpreted as delivery IDs.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.get(
@@ -1950,16 +2147,29 @@ router.get(
         })
       }
 
-      // Never expose OTP through generic delivery lookup.
+      // ─────────────────────────────────────────────────────────────────────
+      // SECURITY
+      //
+      // Generic delivery lookup must never expose the OTP.
+      // ─────────────────────────────────────────────────────────────────────
+
       const safe =
         delivery.toObject()
 
       delete safe.otp
+
       delete safe.otpExpiresAt
 
-      res.json(safe)
+      return res.json(
+        safe
+      )
     } catch (err) {
-      res.status(500).json({
+      console.error(
+        "Get delivery error:",
+        err
+      )
+
+      return res.status(500).json({
         message:
           err.message,
       })
