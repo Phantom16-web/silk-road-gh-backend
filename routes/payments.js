@@ -1,5 +1,4 @@
 import express from "express"
-import crypto from "crypto"
 
 import Order from "../models/Order.js"
 import Payment from "../models/Payment.js"
@@ -31,23 +30,53 @@ function amountsMatch(a, b) {
   )
 }
 
-function paymentAlreadyExists(orderId) {
+function isValidPaymentOrder(order) {
+  if (!order) return false
+
+  if (order.cancelled) return false
+
+  if (
+    order.fulfillmentStatus ===
+    "cancelled"
+  ) {
+    return false
+  }
+
+  if (
+    [
+      "released",
+      "refunded",
+    ].includes(order.paymentStatus)
+  ) {
+    return false
+  }
+
+  return true
+}
+
+async function findActivePayment(orderId) {
   return Payment.findOne({
     order: orderId,
 
     status: {
       $in: [
+        "pending",
         "submitted",
         "under_review",
         "verified",
       ],
     },
+  }).sort({
+    createdAt: -1,
   })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MANUAL PAYMENT SUBMISSION
+// MANUAL PAYMENT
+//
 // POST /api/payments/manual/:orderId
+//
+// This route NEVER contacts Paystack.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.post(
@@ -84,10 +113,14 @@ router.post(
         })
       }
 
-      if (order.cancelled) {
+      if (
+        !isValidPaymentOrder(
+          order
+        )
+      ) {
         return res.status(400).json({
           message:
-            "This order has been cancelled.",
+            "This order cannot accept another payment.",
         })
       }
 
@@ -97,38 +130,32 @@ router.post(
       ) {
         return res.status(400).json({
           message:
-            "This order has already been paid.",
-        })
-      }
-
-      if (
-        order.paymentStatus ===
-        "released"
-      ) {
-        return res.status(400).json({
-          message:
-            "This order has already been settled.",
+            "This order is already in escrow.",
         })
       }
 
       const existing =
-        await paymentAlreadyExists(
+        await findActivePayment(
           order._id
         )
 
       if (existing) {
         return res.status(409).json({
           message:
-            "A payment already exists for this order.",
+            "A payment attempt already exists for this order.",
+
           payment: {
             id: existing._id,
-            status: existing.status,
+            status:
+              existing.status,
+
             reference:
               existing.providerReference,
           },
         })
       }
 
+      // Manual provider does NOT depend on Paystack.
       const provider =
         getPaymentProvider(
           "manual"
@@ -137,8 +164,10 @@ router.post(
       const generated =
         await provider.createPayment({
           order,
-          amount: order.amount,
-          currency: "GHS",
+          amount:
+            order.amount,
+          currency:
+            "GHS",
         })
 
       const payment =
@@ -180,11 +209,11 @@ router.post(
       order.paymentStatus =
         "pending"
 
-      order.status =
-        "Pending Confirmation"
-
       order.fulfillmentStatus =
         "pending_payment"
+
+      order.status =
+        "Pending Confirmation"
 
       await order.save()
 
@@ -226,8 +255,13 @@ router.post(
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PAYSTACK INITIALIZE
+// PAYSTACK INITIALIZATION
+//
 // POST /api/payments/paystack/:orderId
+//
+// Paystack is OPTIONAL.
+//
+// Failure here does NOT affect manual payments.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.post(
@@ -258,10 +292,14 @@ router.post(
         })
       }
 
-      if (order.cancelled) {
+      if (
+        !isValidPaymentOrder(
+          order
+        )
+      ) {
         return res.status(400).json({
           message:
-            "This order has been cancelled.",
+            "This order cannot accept another payment.",
         })
       }
 
@@ -271,12 +309,12 @@ router.post(
       ) {
         return res.status(400).json({
           message:
-            "This order has already been paid.",
+            "This order is already in escrow.",
         })
       }
 
       const existing =
-        await paymentAlreadyExists(
+        await findActivePayment(
           order._id
         )
 
@@ -288,10 +326,17 @@ router.post(
         return res.status(409).json({
           message:
             "A Paystack payment already exists for this order.",
-          reference:
-            existing.providerReference,
-          status:
-            existing.status,
+
+          payment: {
+            id:
+              existing._id,
+
+            reference:
+              existing.providerReference,
+
+            status:
+              existing.status,
+          },
         })
       }
 
@@ -308,6 +353,13 @@ router.post(
             "Buyer account not found.",
         })
       }
+
+      /*
+       * ONLY THIS SECTION knows about Paystack.
+       *
+       * If Paystack throws an error, we return a provider error.
+       * The order remains payable through manual payment.
+       */
 
       const provider =
         getPaymentProvider(
@@ -364,11 +416,11 @@ router.post(
       order.paymentStatus =
         "pending"
 
-      order.status =
-        "Pending Confirmation"
-
       order.fulfillmentStatus =
         "pending_payment"
+
+      order.status =
+        "Pending Confirmation"
 
       await order.save()
 
@@ -415,23 +467,30 @@ router.post(
 
           code:
             err.code,
+
+          fallback:
+            "manual_momo",
         })
       }
 
       res.status(500).json({
         message:
           "Unable to initialize Paystack payment.",
+
+        fallback:
+          "manual_momo",
       })
     }
   }
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VERIFY PAYSTACK
+// VERIFY PAYSTACK PAYMENT
+//
 // POST /api/payments/paystack/:paymentId/verify
 //
-// NEVER trust the frontend's "success" response.
-// We ask Paystack's server directly.
+// NEVER trust frontend success.
+// Backend verifies directly against provider.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.post(
@@ -472,21 +531,6 @@ router.post(
         })
       }
 
-      if (
-        payment.status ===
-        "verified"
-      ) {
-        return res.json({
-          message:
-            "Payment already verified.",
-
-          payment,
-
-          verified:
-            true,
-        })
-      }
-
       const order =
         await Order.findById(
           payment.order
@@ -496,6 +540,23 @@ router.post(
         return res.status(409).json({
           message:
             "Associated order no longer exists.",
+        })
+      }
+
+      if (
+        payment.status ===
+        "verified"
+      ) {
+        return res.json({
+          message:
+            "Payment already verified.",
+
+          verified:
+            true,
+
+          payment,
+
+          order,
         })
       }
 
@@ -509,16 +570,14 @@ router.post(
           payment.providerReference
         )
 
-      // ────────────────────────────────────────────────────────────────────
-      // CRITICAL:
-      //
-      // Successful Paystack status is not enough.
-      // Amount must match the Order.
-      // ────────────────────────────────────────────────────────────────────
+      // ─────────────────────────────────────────────────────────────────────
+      // PROVIDER DID NOT CONFIRM PAYMENT
+      // ─────────────────────────────────────────────────────────────────────
 
       if (!result.verified) {
         payment.status =
-          result.status === "failed"
+          result.status ===
+          "failed"
             ? "failed"
             : "pending"
 
@@ -532,6 +591,16 @@ router.post(
 
         await payment.save()
 
+        if (
+          result.status ===
+          "failed"
+        ) {
+          order.paymentStatus =
+            "failed"
+
+          await order.save()
+        }
+
         return res.status(400).json({
           message:
             "Paystack payment has not been successfully completed.",
@@ -540,6 +609,10 @@ router.post(
             result.status,
         })
       }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // AMOUNT CHECK
+      // ─────────────────────────────────────────────────────────────────────
 
       if (
         !amountsMatch(
@@ -569,11 +642,51 @@ router.post(
         })
       }
 
+      // ─────────────────────────────────────────────────────────────────────
+      // CURRENCY CHECK
+      // ─────────────────────────────────────────────────────────────────────
+
+      if (
+        result.currency &&
+        String(
+          result.currency
+        ).toUpperCase() !==
+          "GHS"
+      ) {
+        payment.status =
+          "failed"
+
+        payment.failedAt =
+          new Date()
+
+        payment.notes =
+          "Unexpected payment currency."
+
+        await payment.save()
+
+        order.paymentStatus =
+          "failed"
+
+        await order.save()
+
+        return res.status(400).json({
+          message:
+            "Payment currency does not match the Silk Road transaction.",
+        })
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // SUCCESS
+      // ─────────────────────────────────────────────────────────────────────
+
       payment.status =
         "verified"
 
       payment.verifiedAt =
         new Date()
+
+      payment.providerData =
+        result.raw || null
 
       await payment.save()
 
@@ -637,6 +750,7 @@ router.post(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET PAYMENT
+//
 // GET /api/payments/:paymentId
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -696,11 +810,20 @@ router.get(
         buyerReference:
           payment.buyerReference,
 
+        evidenceUrl:
+          payment.evidenceUrl,
+
+        notes:
+          payment.notes,
+
         createdAt:
           payment.createdAt,
 
         verifiedAt:
           payment.verifiedAt,
+
+        refundedAt:
+          payment.refundedAt,
       })
     } catch (err) {
       console.error(
@@ -718,7 +841,13 @@ router.get(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ADMIN VERIFY MANUAL PAYMENT
+//
 // PUT /api/payments/manual/:paymentId/verify
+//
+// This is what makes manual payments real.
+//
+// Admin verifies that the money was actually received.
+// Only THEN does the order enter escrow.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.put(
@@ -805,6 +934,12 @@ router.put(
         })
       }
 
+      // Optional admin note
+      if (req.body.notes) {
+        payment.notes =
+          req.body.notes
+      }
+
       payment.status =
         "verified"
 
@@ -815,6 +950,10 @@ router.put(
         new Date()
 
       await payment.save()
+
+      // ─────────────────────────────────────────────────────────────────────
+      // THIS IS THE ESCROW TRANSITION
+      // ─────────────────────────────────────────────────────────────────────
 
       order.paymentMethod =
         "manual_momo"
@@ -870,6 +1009,398 @@ router.put(
       res.status(500).json({
         message:
           "Unable to verify manual payment.",
+      })
+    }
+  }
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN REJECT MANUAL PAYMENT
+//
+// PUT /api/payments/manual/:paymentId/reject
+//
+// Rejection does NOT mean refund.
+// No money has been accepted into escrow.
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.put(
+  "/manual/:paymentId/reject",
+  requireAdminAuth,
+  requireAnyPermission(
+    "manage_payments"
+  ),
+  async (req, res) => {
+    try {
+      const payment =
+        await Payment.findById(
+          req.params.paymentId
+        )
+
+      if (!payment) {
+        return res.status(404).json({
+          message:
+            "Payment not found.",
+        })
+      }
+
+      if (
+        payment.provider !==
+        "manual"
+      ) {
+        return res.status(400).json({
+          message:
+            "This is not a manual payment.",
+        })
+      }
+
+      if (
+        payment.status ===
+        "verified"
+      ) {
+        return res.status(400).json({
+          message:
+            "A verified payment cannot be rejected. Use the refund/dispute process.",
+        })
+      }
+
+      payment.status =
+        "failed"
+
+      payment.failedAt =
+        new Date()
+
+      payment.notes =
+        req.body.reason ||
+        payment.notes ||
+        "Manual payment rejected."
+
+      await payment.save()
+
+      const order =
+        await Order.findById(
+          payment.order
+        )
+
+      if (order) {
+        order.paymentStatus =
+          "failed"
+
+        order.fulfillmentStatus =
+          "pending_payment"
+
+        order.status =
+          "Payment Failed"
+
+        await order.save()
+      }
+
+      await logAction(
+        req,
+        "manual_payment_rejected",
+        "payment",
+        payment._id.toString(),
+        {
+          orderId:
+            payment.order.toString(),
+
+          reason:
+            req.body.reason ||
+            "",
+        }
+      )
+
+      res.json({
+        message:
+          "Manual payment rejected.",
+
+        payment,
+
+        order,
+      })
+    } catch (err) {
+      console.error(
+        "Manual rejection error:",
+        err
+      )
+
+      res.status(500).json({
+        message:
+          "Unable to reject manual payment.",
+      })
+    }
+  }
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN REQUEST REFUND
+//
+// PUT /api/payments/:paymentId/refund-request
+//
+// This does NOT claim the buyer has received money.
+//
+// It creates:
+// payment.status = refunded? NO.
+//
+// Order becomes:
+// paymentStatus = refund_pending
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.put(
+  "/:paymentId/refund-request",
+  requireAdminAuth,
+  requireAnyPermission(
+    "manage_payments",
+    "manage_refunds",
+    "issue_refund_decisions"
+  ),
+  async (req, res) => {
+    try {
+      const payment =
+        await Payment.findById(
+          req.params.paymentId
+        )
+
+      if (!payment) {
+        return res.status(404).json({
+          message:
+            "Payment not found.",
+        })
+      }
+
+      const order =
+        await Order.findById(
+          payment.order
+        )
+
+      if (!order) {
+        return res.status(404).json({
+          message:
+            "Associated order not found.",
+        })
+      }
+
+      if (
+        order.paymentStatus ===
+        "refunded"
+      ) {
+        return res.status(400).json({
+          message:
+            "Order is already refunded.",
+        })
+      }
+
+      if (
+        order.paymentStatus ===
+        "refund_pending"
+      ) {
+        return res.status(409).json({
+          message:
+            "Refund is already pending.",
+        })
+      }
+
+      if (
+        ![
+          "escrow_held",
+          "release_pending",
+        ].includes(
+          order.paymentStatus
+        )
+      ) {
+        return res.status(400).json({
+          message:
+            `Order is not refundable from its current financial state: ${order.paymentStatus}.`,
+        })
+      }
+
+      payment.refundRequestedAt =
+        new Date()
+
+      payment.refundRequestedBy =
+        req.adminUser._id
+
+      payment.refundReason =
+        req.body.reason ||
+        "Silk Road refund request."
+
+      await payment.save()
+
+      order.paymentStatus =
+        "refund_pending"
+
+      await order.save()
+
+      await logAction(
+        req,
+        "refund_requested",
+        "payment",
+        payment._id.toString(),
+        {
+          orderId:
+            order._id.toString(),
+
+          localOrderId:
+            order.localOrderId,
+
+          amount:
+            payment.amount,
+
+          reason:
+            payment.refundReason,
+        }
+      )
+
+      res.json({
+        message:
+          "Refund marked as pending processing.",
+
+        payment,
+
+        order,
+      })
+    } catch (err) {
+      console.error(
+        "Refund request error:",
+        err
+      )
+
+      res.status(500).json({
+        message:
+          "Unable to request refund.",
+      })
+    }
+  }
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN COMPLETE REFUND
+//
+// PUT /api/payments/:paymentId/refund-complete
+//
+// This endpoint should ONLY be used after the actual money movement has
+// happened.
+//
+// It is deliberately separate from refund-request.
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.put(
+  "/:paymentId/refund-complete",
+  requireAdminAuth,
+  requireAnyPermission(
+    "manage_refunds"
+  ),
+  async (req, res) => {
+    try {
+      const payment =
+        await Payment.findById(
+          req.params.paymentId
+        )
+
+      if (!payment) {
+        return res.status(404).json({
+          message:
+            "Payment not found.",
+        })
+      }
+
+      const order =
+        await Order.findById(
+          payment.order
+        )
+
+      if (!order) {
+        return res.status(404).json({
+          message:
+            "Associated order not found.",
+        })
+      }
+
+      if (
+        order.paymentStatus !==
+        "refund_pending"
+      ) {
+        return res.status(400).json({
+          message:
+            "Order is not awaiting refund completion.",
+        })
+      }
+
+      payment.status =
+        "refunded"
+
+      payment.refundedAt =
+        new Date()
+
+      payment.refundedBy =
+        req.adminUser._id
+
+      payment.refundReference =
+        req.body.refundReference ||
+        null
+
+      await payment.save()
+
+      order.paymentStatus =
+        "refunded"
+
+      order.refundedAt =
+        new Date()
+
+      order.fulfillmentStatus =
+        "cancelled"
+
+      order.cancelled =
+        true
+
+      if (
+        !order.cancelledAt
+      ) {
+        order.cancelledAt =
+          new Date()
+      }
+
+      order.status =
+        "Refunded"
+
+      await order.save()
+
+      await logAction(
+        req,
+        "refund_completed",
+        "payment",
+        payment._id.toString(),
+        {
+          orderId:
+            order._id.toString(),
+
+          localOrderId:
+            order.localOrderId,
+
+          amount:
+            payment.amount,
+
+          refundReference:
+            payment.refundReference,
+        }
+      )
+
+      res.json({
+        message:
+          "Refund completed and transaction marked refunded.",
+
+        payment,
+
+        order,
+      })
+    } catch (err) {
+      console.error(
+        "Refund completion error:",
+        err
+      )
+
+      res.status(500).json({
+        message:
+          "Unable to complete refund.",
       })
     }
   }
