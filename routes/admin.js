@@ -1,10 +1,13 @@
 import express from "express"
+
 import User from "../models/User.js"
 import Listing from "../models/Listing.js"
 import Order from "../models/Order.js"
 import Rider from "../models/Rider.js"
 import Delivery from "../models/Delivery.js"
 import Admin from "../models/Admin.js"
+import Payment from "../models/Payment.js"
+
 import {
   requireAdminAuth,
   requireOwnerOrSuperAdmin,
@@ -12,15 +15,22 @@ import {
   requireAnyPermission,
   logAction,
 } from "../middleware/adminAuth.js"
-const router = express.Router()
+
+const router =
+  express.Router()
+
 // ─────────────────────────────────────────────────────────────────────────────
-// ALL ADMIN ROUTES REQUIRE ADMIN AUTHENTICATION
+// ADMIN AUTH
 // ─────────────────────────────────────────────────────────────────────────────
-router.use(requireAdminAuth)
+
+router.use(
+  requireAdminAuth
+)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DASHBOARD
-// Available to all authenticated admins
 // ─────────────────────────────────────────────────────────────────────────────
+
 router.get(
   "/dashboard",
   async (req, res) => {
@@ -32,64 +42,67 @@ router.get(
         totalRiders,
         completedOrders,
         escrowOrders,
+        pendingOrders,
         releasePendingOrders,
         refundPendingOrders,
-        refundedOrders,
-        pendingOrders,
         totalDeliveries,
         activeDeliveries,
-      ] = await Promise.all([
-        User.countDocuments(),
-        Listing.countDocuments(),
-        Order.countDocuments(),
-        Rider.countDocuments(),
-        // New source of truth
-        Order.countDocuments({
-          fulfillmentStatus: "completed",
-        }),
-        Order.countDocuments({
-          paymentStatus: "escrow_held",
-        }),
-        Order.countDocuments({
-          paymentStatus:
-            "release_pending",
-        }),
-        Order.countDocuments({
-          paymentStatus:
-            "refund_pending",
-        }),
-        Order.countDocuments({
-          paymentStatus: "refunded",
-        }),
-        Order.countDocuments({
-          $or: [
-            {
-              paymentStatus:
+      ] =
+        await Promise.all([
+          User.countDocuments(),
+
+          Listing.countDocuments(),
+
+          Order.countDocuments(),
+
+          Rider.countDocuments(),
+
+          Order.countDocuments({
+            paymentStatus:
+              "released",
+          }),
+
+          Order.countDocuments({
+            paymentStatus:
+              "escrow_held",
+          }),
+
+          Order.countDocuments({
+            paymentStatus: {
+              $in: [
                 "pending",
+                "failed",
+              ],
             },
-            {
-              status: "Pending",
+          }),
+
+          Order.countDocuments({
+            paymentStatus:
+              "release_pending",
+          }),
+
+          Order.countDocuments({
+            paymentStatus:
+              "refund_pending",
+          }),
+
+          Delivery.countDocuments(),
+
+          Delivery.countDocuments({
+            status: {
+              $in: [
+                "accepted",
+                "picked_up",
+                "delivered",
+              ],
             },
-            {
-              status:
-                "Pending Confirmation",
-            },
-          ],
-        }),
-        Delivery.countDocuments(),
-        Delivery.countDocuments({
-          status: {
-            $in: [
-              "accepted",
-              "picked_up",
-              "delivered",
-            ],
-          },
-        }),
-      ])
+          }),
+        ])
+
       // ─────────────────────────────────────────────────────────────────────
-      // FINANCIAL DASHBOARD
+      // FINANCIAL SUMMARY
       // ─────────────────────────────────────────────────────────────────────
+
       const revenueAgg =
         await Order.aggregate([
           {
@@ -98,32 +111,36 @@ router.get(
                 "released",
             },
           },
+
           {
             $group: {
               _id: null,
+
               totalRevenue: {
                 $sum:
                   "$platformFee",
               },
+
               totalVolume: {
-                $sum: "$amount",
-              },
-              sellerPayouts: {
                 $sum:
-                  "$sellerAmount",
+                  "$amount",
               },
             },
           },
         ])
+
       const revenue =
-        revenueAgg[0] || {
-          totalRevenue: 0,
-          totalVolume: 0,
-          sellerPayouts: 0,
-        }
+        revenueAgg[0]
+          ?.totalRevenue || 0
+
+      const totalVolume =
+        revenueAgg[0]
+          ?.totalVolume || 0
+
       // ─────────────────────────────────────────────────────────────────────
       // ESCROW
       // ─────────────────────────────────────────────────────────────────────
+
       const escrowAgg =
         await Order.aggregate([
           {
@@ -132,103 +149,62 @@ router.get(
                 "escrow_held",
             },
           },
+
           {
             $group: {
               _id: null,
+
               total: {
-                $sum: "$amount",
-              },
-            },
-          },
-        ])
-      const escrowHeld =
-        escrowAgg[0]?.total || 0
-      // ─────────────────────────────────────────────────────────────────────
-      // RELEASE PENDING
-      // ─────────────────────────────────────────────────────────────────────
-      const releasePendingAgg =
-        await Order.aggregate([
-          {
-            $match: {
-              paymentStatus:
-                "release_pending",
-            },
-          },
-          {
-            $group: {
-              _id: null,
-              total: {
-                $sum: "$amount",
-              },
-              sellerAmount: {
                 $sum:
-                  "$sellerAmount",
+                  "$amount",
               },
             },
           },
         ])
-      const releasePending =
-        releasePendingAgg[0] || {
-          total: 0,
-          sellerAmount: 0,
-        }
-      // ─────────────────────────────────────────────────────────────────────
-      // REFUND PENDING
-      // ─────────────────────────────────────────────────────────────────────
-      const refundPendingAgg =
-        await Order.aggregate([
-          {
-            $match: {
-              paymentStatus:
-                "refund_pending",
-            },
-          },
-          {
-            $group: {
-              _id: null,
-              total: {
-                $sum: "$amount",
-              },
-            },
-          },
-        ])
-      const refundPending =
-        refundPendingAgg[0]?.total ||
+
+      const escrowHeld =
+        escrowAgg[0]?.total ||
         0
+
       res.json({
-        users: totalUsers,
+        users:
+          totalUsers,
+
         listings:
           totalListings,
+
         orders:
           totalOrders,
+
         riders:
           totalRiders,
+
         completedOrders,
+
         escrowOrders,
-        releasePendingOrders,
-        refundPendingOrders,
-        refundedOrders,
+
         pendingOrders,
+
+        releasePendingOrders,
+
+        refundPendingOrders,
+
         totalDeliveries,
+
         activeDeliveries,
-        revenue:
-          revenue.totalRevenue,
-        totalVolume:
-          revenue.totalVolume,
-        sellerPayouts:
-          revenue.sellerPayouts,
+
+        revenue,
+
+        totalVolume,
+
         escrowHeld,
-        releasePending:
-          releasePending.total,
-        releasePendingSellerAmount:
-          releasePending.sellerAmount,
-        refundPending,
       })
     } catch (err) {
       console.error(
         "Admin dashboard error:",
         err
       )
+
       res.status(500).json({
         message:
           err.message,
@@ -236,12 +212,16 @@ router.get(
     }
   }
 )
+
 // ─────────────────────────────────────────────────────────────────────────────
 // USERS
 // ─────────────────────────────────────────────────────────────────────────────
+
 router.get(
   "/users",
-  requirePermission("view_users"),
+  requirePermission(
+    "view_users"
+  ),
   async (req, res) => {
     try {
       const {
@@ -250,55 +230,78 @@ router.get(
         search = "",
         status,
       } = req.query
+
       const query = {}
-      if (search.trim()) {
+
+      if (
+        search.trim()
+      ) {
         query.$or = [
           {
             name: {
-              $regex: search,
-              $options: "i",
+              $regex:
+                search,
+              $options:
+                "i",
             },
           },
+
           {
             email: {
-              $regex: search,
-              $options: "i",
+              $regex:
+                search,
+              $options:
+                "i",
             },
           },
         ]
       }
+
       if (status) {
-        query.status = status
+        query.status =
+          status
       }
+
       const [
         users,
         total,
-      ] = await Promise.all([
-        User.find(query)
-          .select(
-            "-passwordHash"
+      ] =
+        await Promise.all([
+          User.find(
+            query
           )
-          .sort({
-            createdAt: -1,
-          })
-          .skip(
-            (page - 1) * limit
-          )
-          .limit(
-            Number(limit)
+            .select(
+              "-passwordHash"
+            )
+            .sort({
+              createdAt:
+                -1,
+            })
+            .skip(
+              (page - 1) *
+                limit
+            )
+            .limit(
+              Number(limit)
+            ),
+
+          User.countDocuments(
+            query
           ),
-        User.countDocuments(
-          query
-        ),
-      ])
+        ])
+
       res.json({
         users,
+
         total,
+
         page:
           Number(page),
+
         pages:
           Math.ceil(
-            total / limit
+            total /
+              Number(limit)
           ),
       })
     } catch (err) {
@@ -309,9 +312,7 @@ router.get(
     }
   }
 )
-// ─────────────────────────────────────────────────────────────────────────────
-// SUSPEND USER
-// ─────────────────────────────────────────────────────────────────────────────
+
 router.put(
   "/users/:id/suspend",
   requirePermission(
@@ -323,17 +324,22 @@ router.put(
         await User.findById(
           req.params.id
         )
+
       if (!user) {
         return res.status(404).json({
           message:
             "User not found.",
         })
       }
+
       user.status =
         "Suspended"
+
       user.suspendedAt =
         new Date()
+
       await user.save()
+
       await logAction(
         req,
         "user_suspended",
@@ -342,14 +348,17 @@ router.put(
         {
           userEmail:
             user.email,
+
           reason:
             req.body.reason ||
             "",
         }
       )
+
       res.json({
         message:
           `User ${user.email} suspended.`,
+
         user,
       })
     } catch (err) {
@@ -360,9 +369,7 @@ router.put(
     }
   }
 )
-// ─────────────────────────────────────────────────────────────────────────────
-// REINSTATE USER
-// ─────────────────────────────────────────────────────────────────────────────
+
 router.put(
   "/users/:id/reinstate",
   requirePermission(
@@ -374,17 +381,22 @@ router.put(
         await User.findById(
           req.params.id
         )
+
       if (!user) {
         return res.status(404).json({
           message:
             "User not found.",
         })
       }
+
       user.status =
         "Active"
+
       user.suspendedAt =
         null
+
       await user.save()
+
       await logAction(
         req,
         "user_reinstated",
@@ -395,9 +407,11 @@ router.put(
             user.email,
         }
       )
+
       res.json({
         message:
           `User ${user.email} reinstated.`,
+
         user,
       })
     } catch (err) {
@@ -408,9 +422,7 @@ router.put(
     }
   }
 )
-// ─────────────────────────────────────────────────────────────────────────────
-// DELETE USER
-// ─────────────────────────────────────────────────────────────────────────────
+
 router.delete(
   "/users/:id",
   requireOwnerOrSuperAdmin,
@@ -420,15 +432,18 @@ router.delete(
         await User.findById(
           req.params.id
         )
+
       if (!user) {
         return res.status(404).json({
           message:
             "User not found.",
         })
       }
+
       await User.findByIdAndDelete(
         req.params.id
       )
+
       await logAction(
         req,
         "user_deleted",
@@ -439,6 +454,7 @@ router.delete(
             user.email,
         }
       )
+
       res.json({
         message:
           `User ${user.email} permanently deleted.`,
@@ -451,9 +467,11 @@ router.delete(
     }
   }
 )
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LISTINGS
 // ─────────────────────────────────────────────────────────────────────────────
+
 router.get(
   "/listings",
   requireAnyPermission(
@@ -469,59 +487,84 @@ router.get(
         status,
         type,
       } = req.query
+
       const query = {}
-      if (search.trim()) {
+
+      if (
+        search.trim()
+      ) {
         query.$or = [
           {
             title: {
-              $regex: search,
-              $options: "i",
+              $regex:
+                search,
+              $options:
+                "i",
             },
           },
+
           {
             category: {
-              $regex: search,
-              $options: "i",
+              $regex:
+                search,
+              $options:
+                "i",
             },
           },
         ]
       }
+
       if (status) {
-        query.status = status
+        query.status =
+          status
       }
+
       if (type) {
-        query.type = type
+        query.type =
+          type
       }
+
       const [
         listings,
         total,
-      ] = await Promise.all([
-        Listing.find(query)
-          .populate(
-            "seller",
-            "name email university"
+      ] =
+        await Promise.all([
+          Listing.find(
+            query
           )
-          .sort({
-            createdAt: -1,
-          })
-          .skip(
-            (page - 1) * limit
-          )
-          .limit(
-            Number(limit)
+            .populate(
+              "seller",
+              "name email university"
+            )
+            .sort({
+              createdAt:
+                -1,
+            })
+            .skip(
+              (page - 1) *
+                limit
+            )
+            .limit(
+              Number(limit)
+            ),
+
+          Listing.countDocuments(
+            query
           ),
-        Listing.countDocuments(
-          query
-        ),
-      ])
+        ])
+
       res.json({
         listings,
+
         total,
+
         page:
           Number(page),
+
         pages:
           Math.ceil(
-            total / limit
+            total /
+              Number(limit)
           ),
       })
     } catch (err) {
@@ -532,9 +575,7 @@ router.get(
     }
   }
 )
-// ─────────────────────────────────────────────────────────────────────────────
-// FLAG LISTING
-// ─────────────────────────────────────────────────────────────────────────────
+
 router.put(
   "/listings/:id/flag",
   requireAnyPermission(
@@ -547,15 +588,19 @@ router.put(
         await Listing.findById(
           req.params.id
         )
+
       if (!listing) {
         return res.status(404).json({
           message:
             "Listing not found.",
         })
       }
+
       listing.status =
         "Flagged"
+
       await listing.save()
+
       await logAction(
         req,
         "listing_flagged",
@@ -564,14 +609,17 @@ router.put(
         {
           title:
             listing.title,
+
           reason:
             req.body.reason ||
             "",
         }
       )
+
       res.json({
         message:
           "Listing flagged.",
+
         listing,
       })
     } catch (err) {
@@ -582,9 +630,7 @@ router.put(
     }
   }
 )
-// ─────────────────────────────────────────────────────────────────────────────
-// DELETE LISTING
-// ─────────────────────────────────────────────────────────────────────────────
+
 router.delete(
   "/listings/:id",
   requireAnyPermission(
@@ -597,15 +643,18 @@ router.delete(
         await Listing.findById(
           req.params.id
         )
+
       if (!listing) {
         return res.status(404).json({
           message:
             "Listing not found.",
         })
       }
+
       await Listing.findByIdAndDelete(
         req.params.id
       )
+
       await logAction(
         req,
         "listing_removed",
@@ -614,11 +663,13 @@ router.delete(
         {
           title:
             listing.title,
+
           reason:
             req.body.reason ||
             "",
         }
       )
+
       res.json({
         message:
           "Listing removed.",
@@ -631,9 +682,11 @@ router.delete(
     }
   }
 )
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ORDERS
 // ─────────────────────────────────────────────────────────────────────────────
+
 router.get(
   "/orders",
   requireAnyPermission(
@@ -648,73 +701,83 @@ router.get(
         search = "",
         status,
         paymentStatus,
-        fulfillmentStatus,
       } = req.query
+
       const query = {}
-      if (search.trim()) {
+
+      if (
+        search.trim()
+      ) {
         query.localOrderId = {
-          $regex: search,
-          $options: "i",
+          $regex:
+            search,
+
+          $options:
+            "i",
         }
       }
-      /*
-       * Legacy status filter retained for frontend compatibility.
-       */
+
       if (status) {
-        query.status = status
+        query.status =
+          status
       }
-      /*
-       * New financial state.
-       */
-      if (paymentStatus) {
+
+      if (
+        paymentStatus
+      ) {
         query.paymentStatus =
           paymentStatus
       }
-      /*
-       * New fulfillment state.
-       */
-      if (fulfillmentStatus) {
-        query.fulfillmentStatus =
-          fulfillmentStatus
-      }
+
       const [
         orders,
         total,
-      ] = await Promise.all([
-        Order.find(query)
-          .populate(
-            "listing",
-            "title"
+      ] =
+        await Promise.all([
+          Order.find(
+            query
           )
-          .populate(
-            "buyer",
-            "name email"
-          )
-          .populate(
-            "seller",
-            "name email"
-          )
-          .sort({
-            createdAt: -1,
-          })
-          .skip(
-            (page - 1) * limit
-          )
-          .limit(
-            Number(limit)
+            .populate(
+              "listing",
+              "title image"
+            )
+            .populate(
+              "buyer",
+              "name email"
+            )
+            .populate(
+              "seller",
+              "name email"
+            )
+            .sort({
+              createdAt:
+                -1,
+            })
+            .skip(
+              (page - 1) *
+                limit
+            )
+            .limit(
+              Number(limit)
+            ),
+
+          Order.countDocuments(
+            query
           ),
-        Order.countDocuments(
-          query
-        ),
-      ])
+        ])
+
       res.json({
         orders,
+
         total,
+
         page:
           Number(page),
+
         pages:
           Math.ceil(
-            total / limit
+            total /
+              Number(limit)
           ),
       })
     } catch (err) {
@@ -725,24 +788,17 @@ router.get(
     }
   }
 )
+
 // ─────────────────────────────────────────────────────────────────────────────
 // RELEASE ORDER
 //
-// IMPORTANT:
+// CRITICAL:
 //
-// This is NOT the same as "delivery completed".
+// release_pending → released
 //
-// Delivery completion puts:
-//
-// paymentStatus = release_pending
-//
-// This route performs the administrative financial release:
-//
-// paymentStatus = released
-//
-// The actual external payout provider can be added later without changing
-// the order lifecycle.
+// Nothing else is accepted.
 // ─────────────────────────────────────────────────────────────────────────────
+
 router.put(
   "/orders/:id/release",
   requireAnyPermission(
@@ -755,62 +811,120 @@ router.put(
         await Order.findById(
           req.params.id
         )
+
       if (!order) {
         return res.status(404).json({
           message:
             "Order not found.",
         })
       }
-      // ────────────────────────────────────────────────────────────────────
-      // CANNOT RELEASE A CANCELLED ORDER
-      // ────────────────────────────────────────────────────────────────────
-      if (
-        order.cancelled
-      ) {
-        return res.status(400).json({
-          message:
-            "Cancelled orders cannot be released.",
-        })
-      }
-      // ────────────────────────────────────────────────────────────────────
-      // MUST HAVE VERIFIED ESCROW PAYMENT
-      // ────────────────────────────────────────────────────────────────────
+
       if (
         order.paymentStatus !==
         "release_pending"
       ) {
         return res.status(400).json({
           message:
-            `Order is not awaiting release. Current payment status: ${order.paymentStatus || "unknown"}.`,
+            `Order cannot be released from payment state "${order.paymentStatus}".`,
         })
       }
-      // ────────────────────────────────────────────────────────────────────
-      // DELIVERY MUST ACTUALLY BE COMPLETE
-      // ────────────────────────────────────────────────────────────────────
+
       if (
         order.fulfillmentStatus !==
         "completed"
       ) {
         return res.status(400).json({
           message:
-            "The order must be completed through the delivery/OTP process before funds can be released.",
+            "Order fulfillment has not been completed.",
         })
       }
-      // ────────────────────────────────────────────────────────────────────
-      // RELEASE
-      // ────────────────────────────────────────────────────────────────────
+
+      // ─────────────────────────────────────────────────────────────────────
+      // ACTUAL SILK ROAD SETTLEMENT POINT
+      //
+      // In the current manual architecture, this is the point at which Silk
+      // Road records that the funds are being released.
+      //
+      // When Paystack transfers are later implemented, this block becomes the
+      // provider-specific settlement operation.
+      // ─────────────────────────────────────────────────────────────────────
+
       order.paymentStatus =
         "released"
-      order.releasedAt =
-        new Date()
-      /*
-       * Keep generic order status as Completed.
-       *
-       * Financial state is represented by paymentStatus.
-       */
+
       order.status =
         "Completed"
+
       await order.save()
+
+      // ─────────────────────────────────────────────────────────────────────
+      // RIDER SETTLEMENT
+      // ─────────────────────────────────────────────────────────────────────
+
+      const delivery =
+        await Delivery.findOne({
+          order:
+            order._id,
+
+          status:
+            "completed",
+        })
+
+      if (
+        delivery &&
+        delivery.rider
+      ) {
+        const rider =
+          await Rider.findById(
+            delivery.rider
+          )
+
+        if (rider) {
+          const fee =
+            Number(
+              delivery.deliveryFee ||
+                0
+            )
+
+          const pending =
+            Number(
+              rider.pendingEarnings ||
+                0
+            )
+
+          const amountToSettle =
+            Math.min(
+              fee,
+              pending
+            )
+
+          if (
+            amountToSettle >
+            0
+          ) {
+            rider.pendingEarnings =
+              pending -
+              amountToSettle
+
+            rider.totalEarned =
+              Number(
+                rider.totalEarned ||
+                  0
+              ) +
+              amountToSettle
+
+            rider.totalPaid =
+              Number(
+                rider.totalPaid ||
+                  0
+              ) +
+              amountToSettle
+
+            await rider.save()
+          }
+        }
+      }
+
       await logAction(
         req,
         "order_released",
@@ -819,28 +933,30 @@ router.put(
         {
           localOrderId:
             order.localOrderId,
+
           amount:
             order.amount,
-          sellerAmount:
-            order.sellerAmount,
-          platformFee:
-            order.platformFee,
+
           paymentMethod:
             order.paymentMethod,
+
           paymentStatus:
             "released",
         }
       )
+
       res.json({
         message:
-          "Order financially released.",
+          "Order released and settlement recorded.",
+
         order,
       })
     } catch (err) {
       console.error(
-        "Release order error:",
+        "Order release error:",
         err
       )
+
       res.status(500).json({
         message:
           err.message,
@@ -848,21 +964,15 @@ router.put(
     }
   }
 )
+
 // ─────────────────────────────────────────────────────────────────────────────
-// REFUND ORDER
+// REQUEST REFUND
 //
-// IMPORTANT:
+// release/settlement is NEVER silently reversed here.
 //
-// We do not pretend money has already returned to the buyer.
-//
-// First state:
-//
-// refund_pending
-//
-// Actual provider/manual refund process can then move it to:
-//
-// refunded
+// escrow_held/release_pending → refund_pending
 // ─────────────────────────────────────────────────────────────────────────────
+
 router.put(
   "/orders/:id/refund",
   requireAnyPermission(
@@ -876,33 +986,28 @@ router.put(
         await Order.findById(
           req.params.id
         )
+
       if (!order) {
         return res.status(404).json({
           message:
             "Order not found.",
         })
       }
+
       if (
-        order.paymentStatus ===
-        "refunded"
+        [
+          "refunded",
+          "refund_pending",
+        ].includes(
+          order.paymentStatus
+        )
       ) {
         return res.status(400).json({
           message:
-            "Order already refunded.",
+            "A refund is already pending or completed.",
         })
       }
-      if (
-        order.paymentStatus ===
-        "refund_pending"
-      ) {
-        return res.status(400).json({
-          message:
-            "Refund is already pending processing.",
-        })
-      }
-      // ────────────────────────────────────────────────────────────────────
-      // NO PAYMENT = NOTHING TO REFUND
-      // ────────────────────────────────────────────────────────────────────
+
       if (
         ![
           "escrow_held",
@@ -913,59 +1018,79 @@ router.put(
       ) {
         return res.status(400).json({
           message:
-            `This order has no refundable escrowed payment. Current payment status: ${order.paymentStatus || "unknown"}.`,
+            `Order cannot be refunded from payment state "${order.paymentStatus}".`,
         })
       }
-      // ────────────────────────────────────────────────────────────────────
-      // PREVENT REFUND AFTER ALREADY RELEASED FUNDS
-      // ────────────────────────────────────────────────────────────────────
-      if (
-        order.paymentStatus ===
-        "released"
-      ) {
-        return res.status(400).json({
-          message:
-            "Funds have already been released. Use the dispute/recovery process instead of a standard escrow refund.",
+
+      const payment =
+        await Payment.findOne({
+          order:
+            order._id,
+
+          status: {
+            $in: [
+              "verified",
+              "submitted",
+              "under_review",
+            ],
+          },
+        }).sort({
+          createdAt:
+            -1,
         })
+
+      if (payment) {
+        payment.refundRequestedAt =
+          new Date()
+
+        payment.refundRequestedBy =
+          req.adminUser._id
+
+        payment.refundReason =
+          req.body.reason ||
+          "Admin refund decision."
+
+        await payment.save()
       }
+
       order.paymentStatus =
         "refund_pending"
-      order.fulfillmentStatus =
-        "cancelled"
+
       order.status =
-        "Refunded"
-      order.cancelled =
-        true
-      order.cancelledAt =
-        new Date()
+        "Refund Pending"
+
       await order.save()
+
       await logAction(
         req,
-        "order_refund_requested",
+        "refund_requested",
         "order",
         order._id.toString(),
         {
           localOrderId:
             order.localOrderId,
+
           amount:
             order.amount,
+
           reason:
             req.body.reason ||
             "",
-          paymentMethod:
-            order.paymentMethod,
         }
       )
+
       res.json({
         message:
-          "Refund marked as pending processing.",
+          "Refund is now pending processing.",
+
         order,
       })
     } catch (err) {
       console.error(
-        "Refund order error:",
+        "Refund request error:",
         err
       )
+
       res.status(500).json({
         message:
           err.message,
@@ -973,9 +1098,129 @@ router.put(
     }
   }
 )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COMPLETE REFUND
+//
+// refund_pending → refunded
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.put(
+  "/orders/:id/refund-complete",
+  requireAnyPermission(
+    "manage_refunds"
+  ),
+  async (req, res) => {
+    try {
+      const order =
+        await Order.findById(
+          req.params.id
+        )
+
+      if (!order) {
+        return res.status(404).json({
+          message:
+            "Order not found.",
+        })
+      }
+
+      if (
+        order.paymentStatus !==
+        "refund_pending"
+      ) {
+        return res.status(400).json({
+          message:
+            "Order is not awaiting refund completion.",
+        })
+      }
+
+      const payment =
+        await Payment.findOne({
+          order:
+            order._id,
+        }).sort({
+          createdAt:
+            -1,
+        })
+
+      if (payment) {
+        payment.status =
+          "refunded"
+
+        payment.refundedAt =
+          new Date()
+
+        payment.refundedBy =
+          req.adminUser._id
+
+        payment.refundReference =
+          req.body.refundReference ||
+          null
+
+        await payment.save()
+      }
+
+      order.paymentStatus =
+        "refunded"
+
+      order.fulfillmentStatus =
+        "cancelled"
+
+      order.cancelled =
+        true
+
+      order.cancelledAt =
+        order.cancelledAt ||
+        new Date()
+
+      order.status =
+        "Refunded"
+
+      await order.save()
+
+      await logAction(
+        req,
+        "refund_completed",
+        "order",
+        order._id.toString(),
+        {
+          localOrderId:
+            order.localOrderId,
+
+          amount:
+            order.amount,
+
+          refundReference:
+            req.body
+              .refundReference ||
+            null,
+        }
+      )
+
+      res.json({
+        message:
+          "Refund completed.",
+
+        order,
+      })
+    } catch (err) {
+      console.error(
+        "Refund completion error:",
+        err
+      )
+
+      res.status(500).json({
+        message:
+          err.message,
+      })
+    }
+  }
+)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // RIDERS
 // ─────────────────────────────────────────────────────────────────────────────
+
 router.get(
   "/riders",
   requirePermission(
@@ -988,58 +1233,82 @@ router.get(
         limit = 50,
         search = "",
       } = req.query
+
       const query = {}
-      if (search.trim()) {
+
+      if (
+        search.trim()
+      ) {
         query.$or = [
           {
             name: {
-              $regex: search,
-              $options: "i",
+              $regex:
+                search,
+              $options:
+                "i",
             },
           },
+
           {
             phone: {
-              $regex: search,
-              $options: "i",
+              $regex:
+                search,
+              $options:
+                "i",
             },
           },
+
           {
-            zone: {
-              $regex: search,
-              $options: "i",
+            university: {
+              $regex:
+                search,
+              $options:
+                "i",
             },
           },
         ]
       }
+
       const [
         riders,
         total,
-      ] = await Promise.all([
-        Rider.find(query)
-          .select(
-            "-passwordHash"
+      ] =
+        await Promise.all([
+          Rider.find(
+            query
           )
-          .sort({
-            createdAt: -1,
-          })
-          .skip(
-            (page - 1) * limit
-          )
-          .limit(
-            Number(limit)
+            .select(
+              "-password"
+            )
+            .sort({
+              createdAt:
+                -1,
+            })
+            .skip(
+              (page - 1) *
+                limit
+            )
+            .limit(
+              Number(limit)
+            ),
+
+          Rider.countDocuments(
+            query
           ),
-        Rider.countDocuments(
-          query
-        ),
-      ])
+        ])
+
       res.json({
         riders,
+
         total,
+
         page:
           Number(page),
+
         pages:
           Math.ceil(
-            total / limit
+            total /
+              Number(limit)
           ),
       })
     } catch (err) {
@@ -1050,9 +1319,7 @@ router.get(
     }
   }
 )
-// ─────────────────────────────────────────────────────────────────────────────
-// DEACTIVATE RIDER
-// ─────────────────────────────────────────────────────────────────────────────
+
 router.put(
   "/riders/:id/deactivate",
   requirePermission(
@@ -1064,15 +1331,19 @@ router.put(
         await Rider.findById(
           req.params.id
         )
+
       if (!rider) {
         return res.status(404).json({
           message:
             "Rider not found.",
         })
       }
+
       rider.isActive =
         false
+
       await rider.save()
+
       await logAction(
         req,
         "rider_deactivated",
@@ -1081,11 +1352,13 @@ router.put(
         {
           name:
             rider.name,
+
           reason:
             req.body.reason ||
             "",
         }
       )
+
       res.json({
         message:
           `Rider ${rider.name} deactivated.`,
@@ -1098,9 +1371,7 @@ router.put(
     }
   }
 )
-// ─────────────────────────────────────────────────────────────────────────────
-// ACTIVATE RIDER
-// ─────────────────────────────────────────────────────────────────────────────
+
 router.put(
   "/riders/:id/activate",
   requirePermission(
@@ -1112,15 +1383,19 @@ router.put(
         await Rider.findById(
           req.params.id
         )
+
       if (!rider) {
         return res.status(404).json({
           message:
             "Rider not found.",
         })
       }
+
       rider.isActive =
         true
+
       await rider.save()
+
       await logAction(
         req,
         "rider_activated",
@@ -1131,6 +1406,7 @@ router.put(
             rider.name,
         }
       )
+
       res.json({
         message:
           `Rider ${rider.name} activated.`,
@@ -1143,9 +1419,7 @@ router.put(
     }
   }
 )
-// ─────────────────────────────────────────────────────────────────────────────
-// DELETE RIDER
-// ─────────────────────────────────────────────────────────────────────────────
+
 router.delete(
   "/riders/:id",
   requireOwnerOrSuperAdmin,
@@ -1155,15 +1429,18 @@ router.delete(
         await Rider.findById(
           req.params.id
         )
+
       if (!rider) {
         return res.status(404).json({
           message:
             "Rider not found.",
         })
       }
+
       await Rider.findByIdAndDelete(
         req.params.id
       )
+
       await logAction(
         req,
         "rider_deleted",
@@ -1174,6 +1451,7 @@ router.delete(
             rider.name,
         }
       )
+
       res.json({
         message:
           `Rider ${rider.name} permanently deleted.`,
@@ -1186,9 +1464,11 @@ router.delete(
     }
   }
 )
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DELIVERIES
 // ─────────────────────────────────────────────────────────────────────────────
+
 router.get(
   "/deliveries",
   requireAnyPermission(
@@ -1202,53 +1482,59 @@ router.get(
         limit = 50,
         status,
       } = req.query
+
       const query = {}
+
       if (status) {
         query.status =
           status
       }
+
       const [
         deliveries,
         total,
-      ] = await Promise.all([
-        Delivery.find(query)
-          .populate(
-            "rider",
-            "name phone"
+      ] =
+        await Promise.all([
+          Delivery.find(
+            query
           )
-          .populate(
-            "seller",
-            "name email"
-          )
-          .populate(
-            "buyer",
-            "name email"
-          )
-          .populate(
-            "order",
-            "localOrderId amount paymentStatus fulfillmentStatus"
-          )
-          .sort({
-            createdAt: -1,
-          })
-          .skip(
-            (page - 1) * limit
-          )
-          .limit(
-            Number(limit)
+            .populate(
+              "rider",
+              "name phone"
+            )
+            .populate(
+              "seller",
+              "name email"
+            )
+            .sort({
+              createdAt:
+                -1,
+            })
+            .skip(
+              (page - 1) *
+                limit
+            )
+            .limit(
+              Number(limit)
+            ),
+
+          Delivery.countDocuments(
+            query
           ),
-        Delivery.countDocuments(
-          query
-        ),
-      ])
+        ])
+
       res.json({
         deliveries,
+
         total,
+
         page:
           Number(page),
+
         pages:
           Math.ceil(
-            total / limit
+            total /
+              Number(limit)
           ),
       })
     } catch (err) {
@@ -1259,10 +1545,11 @@ router.get(
     }
   }
 )
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AUDIT LOGS
-// Owner or Super Admin only
 // ─────────────────────────────────────────────────────────────────────────────
+
 router.get(
   "/audit-logs",
   requireOwnerOrSuperAdmin,
@@ -1272,15 +1559,19 @@ router.get(
         page = 1,
         limit = 100,
       } = req.query
+
       const admins =
         await Admin.find()
           .select(
             "name email role auditLog"
           )
           .sort({
-            createdAt: -1,
+            createdAt:
+              -1,
           })
+
       const allLogs = []
+
       admins.forEach(
         (admin) => {
           if (
@@ -1290,14 +1581,18 @@ router.get(
           ) {
             return
           }
+
           admin.auditLog.forEach(
             (entry) => {
               allLogs.push({
                 ...entry.toObject(),
+
                 adminName:
                   admin.name,
+
                 adminEmail:
                   admin.email,
+
                 adminRole:
                   admin.role,
               })
@@ -1305,38 +1600,46 @@ router.get(
           )
         }
       )
+
       allLogs.sort(
         (a, b) =>
-          new Date(b.at) -
-          new Date(a.at)
+          new Date(
+            b.at
+          ) -
+          new Date(
+            a.at
+          )
       )
+
       const start =
-        (page - 1) *
+        (Number(page) -
+          1) *
         Number(limit)
+
       const paged =
         allLogs.slice(
           start,
           start +
             Number(limit)
         )
-      const total =
-        allLogs.length
+
       res.json({
         logs:
           paged,
-        total,
+
+        total:
+          allLogs.length,
+
         page:
           Number(page),
+
         pages:
           Math.ceil(
-            total / limit
+            allLogs.length /
+              Number(limit)
           ),
       })
     } catch (err) {
-      console.error(
-        "Audit log error:",
-        err
-      )
       res.status(500).json({
         message:
           err.message,
@@ -1344,9 +1647,11 @@ router.get(
     }
   }
 )
+
 // ─────────────────────────────────────────────────────────────────────────────
 // FINANCIAL REPORTS
 // ─────────────────────────────────────────────────────────────────────────────
+
 router.get(
   "/reports/financial",
   requirePermission(
@@ -1358,176 +1663,208 @@ router.get(
         from,
         to,
       } = req.query
-      /*
-       * Financial revenue means money that has actually
-       * reached the RELEASED state.
-       *
-       * Completed delivery alone is NOT revenue.
-       */
+
       const match = {
         paymentStatus:
           "released",
       }
-      if (from || to) {
-        match.releasedAt =
+
+      if (
+        from ||
+        to
+      ) {
+        match.createdAt =
           {}
+
         if (from) {
-          match.releasedAt.$gte =
+          match.createdAt.$gte =
             new Date(from)
         }
+
         if (to) {
-          match.releasedAt.$lte =
+          match.createdAt.$lte =
             new Date(to)
         }
       }
+
       const [
         revenue,
         byMethod,
         topSellers,
-      ] = await Promise.all([
-        Order.aggregate([
-          {
-            $match:
-              match,
-          },
-          {
-            $group: {
-              _id: null,
-              totalRevenue: {
-                $sum:
-                  "$platformFee",
-              },
-              totalVolume: {
-                $sum:
-                  "$amount",
-              },
-              totalSellerPayouts: {
-                $sum:
-                  "$sellerAmount",
-              },
-              totalOrders: {
-                $sum: 1,
-              },
-              avgOrderValue: {
-                $avg:
-                  "$amount",
+      ] =
+        await Promise.all([
+          Order.aggregate([
+            {
+              $match:
+                match,
+            },
+
+            {
+              $group: {
+                _id: null,
+
+                totalRevenue: {
+                  $sum:
+                    "$platformFee",
+                },
+
+                totalVolume: {
+                  $sum:
+                    "$amount",
+                },
+
+                totalOrders: {
+                  $sum: 1,
+                },
+
+                avgOrderValue: {
+                  $avg:
+                    "$amount",
+                },
               },
             },
-          },
-        ]),
-        Order.aggregate([
-          {
-            $match:
-              match,
-          },
-          {
-            $group: {
-              _id:
-                "$paymentMethod",
-              count: {
-                $sum: 1,
-              },
-              total: {
-                $sum:
-                  "$amount",
-              },
+          ]),
+
+          Order.aggregate([
+            {
+              $match:
+                match,
             },
-          },
-        ]),
-        Order.aggregate([
-          {
-            $match:
-              match,
-          },
-          {
-            $group: {
-              _id:
-                "$seller",
-              totalSales: {
-                $sum:
-                  "$amount",
-              },
-              orderCount: {
-                $sum: 1,
-              },
-              totalEarnings: {
-                $sum:
-                  "$sellerAmount",
+
+            {
+              $group: {
+                _id:
+                  "$paymentMethod",
+
+                count: {
+                  $sum: 1,
+                },
+
+                total: {
+                  $sum:
+                    "$amount",
+                },
               },
             },
-          },
-          {
-            $sort: {
-              totalSales:
-                -1,
+          ]),
+
+          Order.aggregate([
+            {
+              $match:
+                match,
             },
-          },
-          {
-            $limit: 10,
-          },
-          {
-            $lookup: {
-              from:
-                "users",
-              localField:
-                "_id",
-              foreignField:
-                "_id",
-              as:
-                "seller",
+
+            {
+              $group: {
+                _id:
+                  "$seller",
+
+                totalSales: {
+                  $sum:
+                    "$amount",
+                },
+
+                orderCount: {
+                  $sum: 1,
+                },
+
+                totalEarnings: {
+                  $sum:
+                    "$sellerAmount",
+                },
+              },
             },
-          },
-          {
-            $unwind: {
-              path:
-                "$seller",
-              preserveNullAndEmptyArrays:
-                true,
+
+            {
+              $sort: {
+                totalSales:
+                  -1,
+              },
             },
-          },
-          {
-            $project: {
-              sellerName:
-                "$seller.name",
-              sellerEmail:
-                "$seller.email",
-              totalSales:
-                1,
-              orderCount:
-                1,
-              totalEarnings:
-                1,
+
+            {
+              $limit: 10,
             },
-          },
-        ]),
-      ])
+
+            {
+              $lookup: {
+                from:
+                  "users",
+
+                localField:
+                  "_id",
+
+                foreignField:
+                  "_id",
+
+                as:
+                  "seller",
+              },
+            },
+
+            {
+              $unwind: {
+                path:
+                  "$seller",
+
+                preserveNullAndEmptyArrays:
+                  true,
+              },
+            },
+
+            {
+              $project: {
+                sellerName:
+                  "$seller.name",
+
+                sellerEmail:
+                  "$seller.email",
+
+                totalSales:
+                  1,
+
+                orderCount:
+                  1,
+
+                totalEarnings:
+                  1,
+              },
+            },
+          ]),
+        ])
+
       res.json({
         summary:
-          revenue[0] || {
-            totalRevenue: 0,
-            totalVolume: 0,
-            totalSellerPayouts:
+          revenue[0] ||
+          {
+            totalRevenue:
               0,
-            totalOrders: 0,
+
+            totalVolume:
+              0,
+
+            totalOrders:
+              0,
+
             avgOrderValue:
               0,
           },
+
         byMethod,
+
         topSellers,
+
         period: {
           from:
             from ||
             "all time",
+
           to:
             to ||
             "now",
         },
       })
     } catch (err) {
-      console.error(
-        "Financial report error:",
-        err
-      )
       res.status(500).json({
         message:
           err.message,
@@ -1535,9 +1872,11 @@ router.get(
     }
   }
 )
+
 // ─────────────────────────────────────────────────────────────────────────────
-// SECURITY ACTIVITY
+// SECURITY
 // ─────────────────────────────────────────────────────────────────────────────
+
 router.get(
   "/security/activity",
   requirePermission(
@@ -1552,6 +1891,7 @@ router.get(
               60 *
               1000
         )
+
       const suspicious =
         await Order.aggregate([
           {
@@ -1562,19 +1902,23 @@ router.get(
               },
             },
           },
+
           {
             $group: {
               _id:
                 "$payerPhone",
+
               count: {
                 $sum: 1,
               },
+
               orders: {
                 $push:
                   "$localOrderId",
               },
             },
           },
+
           {
             $match: {
               count: {
@@ -1582,12 +1926,15 @@ router.get(
               },
             },
           },
+
           {
             $sort: {
-              count: -1,
+              count:
+                -1,
             },
           },
         ])
+
       const suspendedUsers =
         await User.find({
           status:
@@ -1597,9 +1944,11 @@ router.get(
             "name email suspendedAt"
           )
           .sort({
-            suspendedAt: -1,
+            suspendedAt:
+              -1,
           })
           .limit(20)
+
       const flaggedListings =
         await Listing.find({
           status:
@@ -1610,19 +1959,19 @@ router.get(
             "name email"
           )
           .sort({
-            updatedAt: -1,
+            updatedAt:
+              -1,
           })
           .limit(20)
+
       res.json({
         suspicious,
+
         suspendedUsers,
+
         flaggedListings,
       })
     } catch (err) {
-      console.error(
-        "Security activity error:",
-        err
-      )
       res.status(500).json({
         message:
           err.message,
@@ -1630,4 +1979,5 @@ router.get(
     }
   }
 )
+
 export default router
