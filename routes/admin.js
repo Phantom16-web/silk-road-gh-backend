@@ -166,6 +166,77 @@ router.get(
         escrowAgg[0]?.total ||
         0
 
+      // ─────────────────────────────────────────────────────────────────────
+      // RELEASE PENDING VALUE
+      // ─────────────────────────────────────────────────────────────────────
+
+      const releasePendingAgg =
+        await Order.aggregate([
+          {
+            $match: {
+              paymentStatus:
+                "release_pending",
+            },
+          },
+
+          {
+            $group: {
+              _id: null,
+
+              total: {
+                $sum:
+                  "$amount",
+              },
+
+              sellerAmount: {
+                $sum:
+                  "$sellerAmount",
+              },
+
+              platformFee: {
+                $sum:
+                  "$platformFee",
+              },
+            },
+          },
+        ])
+
+      const releasePending =
+        releasePendingAgg[0] || {
+          total: 0,
+          sellerAmount: 0,
+          platformFee: 0,
+        }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // REFUND PENDING VALUE
+      // ─────────────────────────────────────────────────────────────────────
+
+      const refundPendingAgg =
+        await Order.aggregate([
+          {
+            $match: {
+              paymentStatus:
+                "refund_pending",
+            },
+          },
+
+          {
+            $group: {
+              _id: null,
+
+              total: {
+                $sum:
+                  "$amount",
+              },
+            },
+          },
+        ])
+
+      const refundPending =
+        refundPendingAgg[0]
+          ?.total || 0
+
       res.json({
         users:
           totalUsers,
@@ -198,6 +269,10 @@ router.get(
         totalVolume,
 
         escrowHeld,
+
+        releasePending,
+
+        refundPending,
       })
     } catch (err) {
       console.error(
@@ -792,11 +867,22 @@ router.get(
 // ─────────────────────────────────────────────────────────────────────────────
 // RELEASE ORDER
 //
-// CRITICAL:
+// FINANCIAL STATE:
 //
 // release_pending → released
 //
-// Nothing else is accepted.
+// This is the ONLY admin transition that releases escrow.
+//
+// The route refuses to release:
+//
+// pending
+// failed
+// escrow_held
+// refund_pending
+// refunded
+// released
+//
+// Rider money is settled only here.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.put(
@@ -819,6 +905,10 @@ router.put(
         })
       }
 
+      // ─────────────────────────────────────────────────────────────────────
+      // FINANCIAL STATE GATE
+      // ─────────────────────────────────────────────────────────────────────
+
       if (
         order.paymentStatus !==
         "release_pending"
@@ -828,6 +918,10 @@ router.put(
             `Order cannot be released from payment state "${order.paymentStatus}".`,
         })
       }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // FULFILLMENT STATE GATE
+      // ─────────────────────────────────────────────────────────────────────
 
       if (
         order.fulfillmentStatus !==
@@ -840,25 +934,7 @@ router.put(
       }
 
       // ─────────────────────────────────────────────────────────────────────
-      // ACTUAL SILK ROAD SETTLEMENT POINT
-      //
-      // In the current manual architecture, this is the point at which Silk
-      // Road records that the funds are being released.
-      //
-      // When Paystack transfers are later implemented, this block becomes the
-      // provider-specific settlement operation.
-      // ─────────────────────────────────────────────────────────────────────
-
-      order.paymentStatus =
-        "released"
-
-      order.status =
-        "Completed"
-
-      await order.save()
-
-      // ─────────────────────────────────────────────────────────────────────
-      // RIDER SETTLEMENT
+      // FIND COMPLETED DELIVERY
       // ─────────────────────────────────────────────────────────────────────
 
       const delivery =
@@ -868,62 +944,118 @@ router.put(
 
           status:
             "completed",
+        }).sort({
+          completedAt:
+            -1,
+
+          updatedAt:
+            -1,
         })
+
+      // ─────────────────────────────────────────────────────────────────────
+      // VALIDATE RIDER FINANCIAL POSITION BEFORE CHANGING ORDER STATE
+      // ─────────────────────────────────────────────────────────────────────
+
+      let rider = null
+      let deliveryFee = 0
+      let riderSettlement = 0
+      let previousPendingEarnings = 0
 
       if (
         delivery &&
         delivery.rider
       ) {
-        const rider =
+        rider =
           await Rider.findById(
             delivery.rider
           )
 
-        if (rider) {
-          const fee =
-            Number(
-              delivery.deliveryFee ||
-                0
-            )
-
-          const pending =
-            Number(
-              rider.pendingEarnings ||
-                0
-            )
-
-          const amountToSettle =
-            Math.min(
-              fee,
-              pending
-            )
-
-          if (
-            amountToSettle >
-            0
-          ) {
-            rider.pendingEarnings =
-              pending -
-              amountToSettle
-
-            rider.totalEarned =
-              Number(
-                rider.totalEarned ||
-                  0
-              ) +
-              amountToSettle
-
-            rider.totalPaid =
-              Number(
-                rider.totalPaid ||
-                  0
-              ) +
-              amountToSettle
-
-            await rider.save()
-          }
+        if (!rider) {
+          return res.status(409).json({
+            message:
+              "The rider attached to this delivery could not be found. Release stopped to protect the financial ledger.",
+          })
         }
+
+        deliveryFee =
+          Number(
+            delivery.deliveryFee ||
+              0
+          )
+
+        previousPendingEarnings =
+          Number(
+            rider.pendingEarnings ||
+              0
+          )
+
+        if (
+          previousPendingEarnings <
+          deliveryFee
+        ) {
+          return res.status(409).json({
+            message:
+              "Rider pending earnings are lower than the delivery fee. Release stopped to prevent an incomplete rider settlement.",
+          })
+        }
+
+        riderSettlement =
+          deliveryFee
       }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // RIDER SETTLEMENT
+      //
+      // pendingEarnings → totalEarned
+      //
+      // IMPORTANT:
+      //
+      // totalEarned and totalPaid are NOT touched at delivery completion.
+      // They are touched only when the financial release actually occurs.
+      // ─────────────────────────────────────────────────────────────────────
+
+      if (rider) {
+        rider.pendingEarnings =
+          previousPendingEarnings -
+          riderSettlement
+
+        rider.totalEarned =
+          Number(
+            rider.totalEarned ||
+              0
+          ) +
+          riderSettlement
+
+        rider.totalPaid =
+          Number(
+            rider.totalPaid ||
+              0
+          ) +
+          riderSettlement
+
+        await rider.save()
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // FINAL ORDER FINANCIAL TRANSITION
+      //
+      // release_pending → released
+      // ─────────────────────────────────────────────────────────────────────
+
+      order.paymentStatus =
+        "released"
+
+      order.status =
+        "Completed"
+
+      order.releasedAt =
+        new Date()
+
+      await order.save()
+
+      // ─────────────────────────────────────────────────────────────────────
+      // AUDIT
+      // ─────────────────────────────────────────────────────────────────────
 
       await logAction(
         req,
@@ -935,13 +1067,43 @@ router.put(
             order.localOrderId,
 
           amount:
-            order.amount,
+            Number(
+              order.amount ||
+                0
+            ),
+
+          sellerAmount:
+            Number(
+              order.sellerAmount ||
+                0
+            ),
+
+          platformFee:
+            Number(
+              order.platformFee ||
+                0
+            ),
 
           paymentMethod:
             order.paymentMethod,
 
+          previousPaymentStatus:
+            "release_pending",
+
           paymentStatus:
             "released",
+
+          deliveryId:
+            delivery?._id ||
+            null,
+
+          riderId:
+            delivery?.rider ||
+            null,
+
+          deliveryFee,
+
+          riderSettlement,
         }
       )
 
@@ -950,6 +1112,27 @@ router.put(
           "Order released and settlement recorded.",
 
         order,
+
+        settlement: {
+          riderId:
+            delivery?.rider ||
+            null,
+
+          riderAmount:
+            riderSettlement,
+
+          sellerAmount:
+            Number(
+              order.sellerAmount ||
+                0
+            ),
+
+          platformFee:
+            Number(
+              order.platformFee ||
+                0
+            ),
+        },
       })
     } catch (err) {
       console.error(
@@ -968,9 +1151,18 @@ router.put(
 // ─────────────────────────────────────────────────────────────────────────────
 // REQUEST REFUND
 //
-// release/settlement is NEVER silently reversed here.
+// FINANCIAL STATES:
 //
-// escrow_held/release_pending → refund_pending
+// escrow_held
+//      ↓
+// refund_pending
+//
+// release_pending
+//      ↓
+// refund_pending
+//
+// A RELEASED order cannot be refunded through this route.
+// A refund after settlement requires a separate financial reversal process.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.put(
@@ -1022,6 +1214,10 @@ router.put(
         })
       }
 
+      // ─────────────────────────────────────────────────────────────────────
+      // FIND PAYMENT RECORD
+      // ─────────────────────────────────────────────────────────────────────
+
       const payment =
         await Payment.findOne({
           order:
@@ -1053,6 +1249,13 @@ router.put(
         await payment.save()
       }
 
+      // ─────────────────────────────────────────────────────────────────────
+      // FINANCIAL STATE TRANSITION
+      // ─────────────────────────────────────────────────────────────────────
+
+      const previousPaymentStatus =
+        order.paymentStatus
+
       order.paymentStatus =
         "refund_pending"
 
@@ -1060,6 +1263,10 @@ router.put(
         "Refund Pending"
 
       await order.save()
+
+      // ─────────────────────────────────────────────────────────────────────
+      // AUDIT
+      // ─────────────────────────────────────────────────────────────────────
 
       await logAction(
         req,
@@ -1071,7 +1278,19 @@ router.put(
             order.localOrderId,
 
           amount:
-            order.amount,
+            Number(
+              order.amount ||
+                0
+            ),
+
+          previousPaymentStatus,
+
+          paymentStatus:
+            "refund_pending",
+
+          paymentId:
+            payment?._id ||
+            null,
 
           reason:
             req.body.reason ||
@@ -1102,7 +1321,18 @@ router.put(
 // ─────────────────────────────────────────────────────────────────────────────
 // COMPLETE REFUND
 //
+// FINANCIAL STATE:
+//
 // refund_pending → refunded
+//
+// IMPORTANT:
+//
+// If the order reached release_pending and the rider was provisionally credited
+// into pendingEarnings, that provisional amount must be removed before the
+// refund becomes final.
+//
+// totalEarned and totalPaid are NOT reduced here because they should never have
+// been increased before actual release.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.put(
@@ -1134,6 +1364,10 @@ router.put(
         })
       }
 
+      // ─────────────────────────────────────────────────────────────────────
+      // FIND PAYMENT
+      // ─────────────────────────────────────────────────────────────────────
+
       const payment =
         await Payment.findOne({
           order:
@@ -1142,6 +1376,89 @@ router.put(
           createdAt:
             -1,
         })
+
+      // ─────────────────────────────────────────────────────────────────────
+      // FIND DELIVERY
+      //
+      // We need this because a completed delivery may have already placed the
+      // rider's delivery fee into pendingEarnings.
+      // ─────────────────────────────────────────────────────────────────────
+
+      const delivery =
+        await Delivery.findOne({
+          order:
+            order._id,
+
+          status:
+            "completed",
+        }).sort({
+          completedAt:
+            -1,
+
+          updatedAt:
+            -1,
+        })
+
+      let rider = null
+      let riderPendingReversal = 0
+
+      // ─────────────────────────────────────────────────────────────────────
+      // REMOVE PROVISIONAL RIDER EARNINGS
+      //
+      // Only pendingEarnings is reversed.
+      //
+      // We deliberately do NOT touch totalEarned or totalPaid because those
+      // values represent money that has actually been released/paid.
+      // ─────────────────────────────────────────────────────────────────────
+
+      if (
+        delivery &&
+        delivery.rider
+      ) {
+        rider =
+          await Rider.findById(
+            delivery.rider
+          )
+
+        if (!rider) {
+          return res.status(409).json({
+            message:
+              "The rider attached to this delivery could not be found. Refund completion stopped to protect the financial ledger.",
+          })
+        }
+
+        riderPendingReversal =
+          Number(
+            delivery.deliveryFee ||
+              0
+          )
+
+        const pending =
+          Number(
+            rider.pendingEarnings ||
+              0
+          )
+
+        if (
+          pending <
+          riderPendingReversal
+        ) {
+          return res.status(409).json({
+            message:
+              "Rider pending earnings are lower than the delivery fee that must be reversed. Refund completion stopped to protect the financial ledger.",
+          })
+        }
+
+        rider.pendingEarnings =
+          pending -
+          riderPendingReversal
+
+        await rider.save()
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // PAYMENT REFUND RECORD
+      // ─────────────────────────────────────────────────────────────────────
 
       if (payment) {
         payment.status =
@@ -1159,6 +1476,12 @@ router.put(
 
         await payment.save()
       }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // FINAL ORDER REFUND STATE
+      //
+      // refund_pending → refunded
+      // ─────────────────────────────────────────────────────────────────────
 
       order.paymentStatus =
         "refunded"
@@ -1178,6 +1501,10 @@ router.put(
 
       await order.save()
 
+      // ─────────────────────────────────────────────────────────────────────
+      // AUDIT
+      // ─────────────────────────────────────────────────────────────────────
+
       await logAction(
         req,
         "refund_completed",
@@ -1188,7 +1515,27 @@ router.put(
             order.localOrderId,
 
           amount:
-            order.amount,
+            Number(
+              order.amount ||
+                0
+            ),
+
+          paymentStatus:
+            "refunded",
+
+          paymentId:
+            payment?._id ||
+            null,
+
+          deliveryId:
+            delivery?._id ||
+            null,
+
+          riderId:
+            delivery?.rider ||
+            null,
+
+          riderPendingReversal,
 
           refundReference:
             req.body
@@ -1202,6 +1549,25 @@ router.put(
           "Refund completed.",
 
         order,
+
+        refund: {
+          amount:
+            Number(
+              order.amount ||
+                0
+            ),
+
+          riderPendingReversal,
+
+          riderId:
+            delivery?.rider ||
+            null,
+
+          refundReference:
+            req.body
+              .refundReference ||
+            null,
+        },
       })
     } catch (err) {
       console.error(
