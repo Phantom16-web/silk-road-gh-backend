@@ -3,6 +3,7 @@ import jwt from "jsonwebtoken"
 
 import Order from "../models/Order.js"
 import Listing from "../models/Listing.js"
+
 import protect from "../middleware/auth.js"
 
 const router = express.Router()
@@ -11,19 +12,42 @@ const router = express.Router()
 // HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
-function pushToSeller(req, sellerId, data) {
+function pushToSeller(
+  req,
+  sellerId,
+  data
+) {
   try {
-    const io = req.app.get("io")
-    const sellerSockets = req.app.get("sellerSockets")
-    const queueNotif = req.app.get("queueNotification")
+    const io =
+      req.app.get("io")
 
-    if (!io || !sellerSockets || !sellerId) {
+    const sellerSockets =
+      req.app.get(
+        "sellerSockets"
+      )
+
+    const queueNotif =
+      req.app.get(
+        "queueNotification"
+      )
+
+    if (
+      !io ||
+      !sellerSockets ||
+      !sellerId
+    ) {
       return
     }
 
-    const sockets = sellerSockets.get(String(sellerId))
+    const sockets =
+      sellerSockets.get(
+        String(sellerId)
+      )
 
-    if (!sockets || sockets.size === 0) {
+    if (
+      !sockets ||
+      sockets.size === 0
+    ) {
       if (queueNotif) {
         queueNotif(
           String(sellerId),
@@ -32,22 +56,16 @@ function pushToSeller(req, sellerId, data) {
         )
       }
 
-      console.log(
-        `📬 Seller ${sellerId} offline — new_order queued`
-      )
-
       return
     }
 
-    sockets.forEach((socketId) => {
-      io.to(socketId).emit(
-        "new_order",
-        data
-      )
-    })
-
-    console.log(
-      `📡 Notified seller ${sellerId} of new order`
+    sockets.forEach(
+      (socketId) => {
+        io.to(socketId).emit(
+          "new_order",
+          data
+        )
+      }
     )
   } catch (err) {
     console.error(
@@ -57,84 +75,118 @@ function pushToSeller(req, sellerId, data) {
   }
 }
 
-/*
- * Safely extract a normal user ID from a JWT.
- *
- * This is intentionally only used to attach an optional buyer
- * to a PUBLIC guest-compatible order creation request.
- *
- * It does NOT grant the request authenticated privileges.
- */
-function getOptionalBuyerId(req) {
+function getOptionalBuyerId(
+  req
+) {
   try {
-    const header = req.headers.authorization
+    const header =
+      req.headers.authorization
 
-    if (!header?.startsWith("Bearer ")) {
+    if (
+      !header?.startsWith(
+        "Bearer "
+      )
+    ) {
       return null
     }
 
-    const token = header.split(" ")[1]
+    const token =
+      header.split(" ")[1]
 
-    const decoded = jwt.verify(
-      token,
-      process.env.JWT_SECRET
+    const decoded =
+      jwt.verify(
+        token,
+        process.env.JWT_SECRET
+      )
+
+    return (
+      decoded.id || null
     )
-
-    return decoded.id || null
   } catch {
     return null
   }
 }
 
-/*
- * Calculate the expected listing amount.
- *
- * IMPORTANT:
- *
- * The client is not allowed to define the authoritative
- * listing price.
- *
- * Products/services:
- *     Listing.price
- *
- * Rentals:
- *     Listing.dailyRate × rentalDays
- *
- * The existing frontend can continue sending `amount`,
- * but we compare it against the server calculation.
- */
-function calculateListingAmount(listing, rentalDays) {
+function isMongoId(value) {
+  return (
+    value &&
+    /^[a-f\d]{24}$/i.test(
+      String(value)
+    )
+  )
+}
+
+function amountsMatch(
+  a,
+  b
+) {
+  return (
+    Math.round(
+      Number(a || 0) * 100
+    ) ===
+    Math.round(
+      Number(b || 0) * 100
+    )
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LISTING PRICE
+// ─────────────────────────────────────────────────────────────────────────────
+
+function calculateListingAmount(
+  listing,
+  rentalDays
+) {
   if (!listing) {
     return null
   }
 
-  if (listing.type === "rent") {
-    const days = Number(rentalDays)
+  if (
+    listing.type ===
+    "rent"
+  ) {
+    const days =
+      Number(rentalDays)
 
-    if (!Number.isFinite(days) || days <= 0) {
+    if (
+      !Number.isFinite(days) ||
+      days <= 0
+    ) {
       return null
     }
 
     if (
       listing.maxDays &&
-      days > Number(listing.maxDays)
+      days >
+        Number(
+          listing.maxDays
+        )
     ) {
       return null
     }
 
-    const dailyRate = Number(listing.dailyRate)
+    const dailyRate =
+      Number(
+        listing.dailyRate
+      )
 
     if (
-      !Number.isFinite(dailyRate) ||
+      !Number.isFinite(
+        dailyRate
+      ) ||
       dailyRate < 0
     ) {
       return null
     }
 
-    return dailyRate * days
+    return (
+      dailyRate * days
+    )
   }
 
-  const price = Number(listing.price)
+  const price =
+    Number(listing.price)
 
   if (
     !Number.isFinite(price) ||
@@ -146,47 +198,26 @@ function calculateListingAmount(listing, rentalDays) {
   return price
 }
 
-/*
- * Compare monetary values safely.
- *
- * We use cents/pesewas rather than direct floating-point
- * equality.
- */
-function amountsMatch(a, b) {
-  const first = Math.round(
-    Number(a || 0) * 100
-  )
+// ─────────────────────────────────────────────────────────────────────────────
+// PLATFORM FEE
+// ─────────────────────────────────────────────────────────────────────────────
 
-  const second = Math.round(
-    Number(b || 0) * 100
-  )
-
-  return first === second
-}
-
-/*
- * Platform fee.
- *
- * Current business configuration is 8%.
- *
- * IMPORTANT:
- * The buyer does not control this number.
- */
-function calculatePlatformFee(amount) {
+function calculatePlatformFee(
+  amount
+) {
   return Math.round(
-    Number(amount || 0) * 0.08
+    Number(amount || 0) *
+      0.08
   )
 }
 
-/*
- * Determine whether an order is still cancellable.
- *
- * We keep this conservative for now.
- *
- * The detailed compensation/refund rules will be implemented
- * in the dedicated transaction/dispute layer.
- */
-function canCancelOrder(order) {
+// ─────────────────────────────────────────────────────────────────────────────
+// CANCELLATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+function canCancelOrder(
+  order
+) {
   if (!order) {
     return false
   }
@@ -196,15 +227,12 @@ function canCancelOrder(order) {
   }
 
   if (
-    order.fulfillmentStatus === "completed" ||
-    order.status === "Completed"
-  ) {
-    return false
-  }
-
-  if (
-    order.paymentStatus === "released" ||
-    order.paymentStatus === "refunded"
+    order.fulfillmentStatus ===
+      "completed" ||
+    order.paymentStatus ===
+      "released" ||
+    order.paymentStatus ===
+      "refunded"
   ) {
     return false
   }
@@ -214,431 +242,377 @@ function canCancelOrder(order) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CREATE ORDER
+//
 // POST /api/orders
 //
-// PUBLIC
-//
-// Guests are still supported.
-//
-// IMPORTANT CHANGE:
-//
-// Creating an order does NOT mean payment has happened.
-//
-// New order:
-//
-// paymentStatus     = pending
-// fulfillmentStatus = pending_payment
-// status            = Pending Confirmation
-//
-// Only a verified payment provider/manual verification can
-// move the order into escrow.
+// Creating an order DOES NOT mean payment happened.
 // ─────────────────────────────────────────────────────────────────────────────
 
-router.post("/", async (req, res) => {
-  try {
-    const {
-      listingId,
-      sellerId: bodySellerID,
-      localOrderId,
-      type,
-      amount: clientAmount,
-      paystackRef,
-      location,
-      landmark,
-      extraInfo,
-      contactInfo,
-      payerName,
-      payerPhone,
-      promoCode,
-      discount,
-      deliveryMethod,
-      paymentMethod,
-      rentalDays,
-    } = req.body
-
-    // ───────────────────────────────────────────────────────────────────────
-    // Validate payment method
-    // ───────────────────────────────────────────────────────────────────────
-
-    const selectedPaymentMethod =
-      paymentMethod || "manual_momo"
-
-    if (
-      ![
-        "manual_momo",
-        "paystack",
-      ].includes(selectedPaymentMethod)
-    ) {
-      return res.status(400).json({
-        message: "Unsupported payment method.",
-      })
-    }
-
-    // ───────────────────────────────────────────────────────────────────────
-    // Listing is now strongly preferred/required.
-    //
-    // We need the listing to establish:
-    //
-    // seller
-    // title
-    // image
-    // authoritative price
-    // ───────────────────────────────────────────────────────────────────────
-
-    if (!listingId) {
-      return res.status(400).json({
-        message:
-          "A valid listing is required to create an order.",
-      })
-    }
-
-    const listing = await Listing.findById(
-      listingId
-    ).select(
-      "seller title image type price dailyRate maxDays status"
-    )
-
-    if (!listing) {
-      return res.status(404).json({
-        message: "Listing not found.",
-      })
-    }
-
-    // ───────────────────────────────────────────────────────────────────────
-    // Removed listings cannot be purchased.
-    // ───────────────────────────────────────────────────────────────────────
-
-    if (listing.status !== "Active") {
-      return res.status(400).json({
-        message:
-          "This listing is no longer available.",
-      })
-    }
-
-    // ───────────────────────────────────────────────────────────────────────
-    // SELLER COMES FROM THE LISTING
-    //
-    // We do NOT trust sellerId supplied by the browser.
-    // ───────────────────────────────────────────────────────────────────────
-
-    const resolvedSellerId =
-      String(listing.seller)
-
-    const suppliedSellerId =
-      bodySellerID
-        ? String(bodySellerID)
-        : null
-
-    if (
-      suppliedSellerId &&
-      suppliedSellerId !== resolvedSellerId
-    ) {
-      return res.status(400).json({
-        message:
-          "The selected seller does not match the listing.",
-      })
-    }
-
-    // ───────────────────────────────────────────────────────────────────────
-    // AUTHORITATIVE PRICE
-    // ───────────────────────────────────────────────────────────────────────
-
-    const authoritativeAmount =
-      calculateListingAmount(
-        listing,
-        rentalDays
-      )
-
-    if (
-      authoritativeAmount === null
-    ) {
-      return res.status(400).json({
-        message:
-          listing.type === "rent"
-            ? "Valid rental days are required."
-            : "This listing does not currently have a valid price.",
-      })
-    }
-
-    // ───────────────────────────────────────────────────────────────────────
-    // CLIENT AMOUNT CHECK
-    //
-    // The frontend may still send amount because the existing UI
-    // expects it.
-    //
-    // But the browser no longer gets to define the transaction
-    // amount.
-    // ───────────────────────────────────────────────────────────────────────
-
-    if (
-      clientAmount !== undefined &&
-      clientAmount !== null &&
-      !amountsMatch(
-        clientAmount,
-        authoritativeAmount
-      )
-    ) {
-      return res.status(400).json({
-        message:
-          "The order amount does not match the listing price.",
-        expectedAmount:
-          authoritativeAmount,
-      })
-    }
-
-    const finalAmount =
-      authoritativeAmount
-
-    // ───────────────────────────────────────────────────────────────────────
-    // DISCOUNT
-    //
-    // We preserve the existing frontend's discount field for
-    // compatibility.
-    //
-    // IMPORTANT:
-    //
-    // The discount is capped so the buyer cannot make the final
-    // order amount negative.
-    //
-    // Full server-side promo validation will be moved here when
-    // the promo system becomes database-backed.
-    // ───────────────────────────────────────────────────────────────────────
-
-    let requestedDiscount =
-      Number(discount || 0)
-
-    if (
-      !Number.isFinite(
-        requestedDiscount
-      ) ||
-      requestedDiscount < 0
-    ) {
-      requestedDiscount = 0
-    }
-
-    requestedDiscount = Math.min(
-      requestedDiscount,
-      finalAmount
-    )
-
-    const finalPayableAmount =
-      finalAmount - requestedDiscount
-
-    // ───────────────────────────────────────────────────────────────────────
-    // PLATFORM FEE
-    //
-    // Calculated by Silk Road.
-    // Never supplied by the client.
-    // ───────────────────────────────────────────────────────────────────────
-
-    const platformFee =
-      calculatePlatformFee(
-        finalPayableAmount
-      )
-
-    const sellerAmount =
-      finalPayableAmount -
-      platformFee
-
-    // ───────────────────────────────────────────────────────────────────────
-    // OPTIONAL AUTHENTICATED BUYER
-    //
-    // Guest checkout remains supported.
-    // ───────────────────────────────────────────────────────────────────────
-
-    const buyerId =
-      getOptionalBuyerId(req)
-
-    // ───────────────────────────────────────────────────────────────────────
-    // CREATE ORDER
-    //
-    // THIS IS THE CRITICAL CHANGE.
-    //
-    // An order is NOT automatically placed into escrow.
-    // ───────────────────────────────────────────────────────────────────────
-
-    const order = await Order.create({
-      buyer:
-        buyerId || null,
-
-      seller:
-        resolvedSellerId,
-
-      listing:
-        listing._id,
-
-      localOrderId:
-        localOrderId || null,
-
-      type:
-        type || listing.type || "product",
-
-      amount:
-        finalPayableAmount,
-
-      platformFee,
-
-      sellerAmount,
-
-      discount:
-        requestedDiscount,
-
-      paystackRef:
-        paystackRef || null,
-
-      location:
-        location || null,
-
-      landmark:
-        landmark || null,
-
-      extraInfo:
-        extraInfo || null,
-
-      contactInfo:
-        contactInfo || null,
-
-      payerName:
-        payerName || null,
-
-      payerPhone:
-        payerPhone || null,
-
-      promoCode:
-        promoCode || null,
-
-      deliveryMethod:
-        deliveryMethod || "pickup",
-
-      paymentMethod:
-        selectedPaymentMethod,
-
-      // NEW TRANSACTION STATE
-      status:
-        "Pending Confirmation",
-
-      paymentStatus:
-        "pending",
-
-      fulfillmentStatus:
-        "pending_payment",
-
-      rentalDays:
-        listing.type === "rent"
-          ? Number(rentalDays)
-          : null,
-    })
-
-    // ───────────────────────────────────────────────────────────────────────
-    // SELLER NOTIFICATION
-    //
-    // The seller is informed of the order.
-    //
-    // IMPORTANT:
-    //
-    // At this stage the order is NOT yet confirmed as paid.
-    // The notification explicitly says payment is pending.
-    // ───────────────────────────────────────────────────────────────────────
-
-    pushToSeller(
-      req,
-      resolvedSellerId,
-      {
-        orderId:
-          localOrderId ||
-          String(order._id),
-
-        databaseOrderId:
-          String(order._id),
-
-        itemTitle:
-          listing.title || "Item",
-
-        itemImage:
-          listing.image || null,
-
+router.post(
+  "/",
+  async (req, res) => {
+    try {
+      const {
+        listingId,
+        sellerId:
+          suppliedSellerId,
+        localOrderId,
+        type,
         amount:
-          finalPayableAmount,
+          clientAmount,
+        location,
+        landmark,
+        extraInfo,
+        contactInfo,
+        payerName,
+        payerPhone,
+        promoCode,
+        discount,
+        deliveryMethod,
+        paymentMethod,
+        rentalDays,
+      } = req.body
 
-        buyerName:
-          payerName || "A buyer",
+      const selectedPaymentMethod =
+        paymentMethod ||
+        "manual_momo"
 
-        buyerContact:
-          contactInfo ||
-          payerPhone ||
-          "",
+      if (
+        ![
+          "manual_momo",
+          "paystack",
+        ].includes(
+          selectedPaymentMethod
+        )
+      ) {
+        return res.status(400).json({
+          message:
+            "Unsupported payment method.",
+        })
+      }
 
-        location:
-          location || null,
+      if (!listingId) {
+        return res.status(400).json({
+          message:
+            "A valid listing is required to create an order.",
+        })
+      }
 
-        landmark:
-          landmark || null,
+      const listing =
+        await Listing.findById(
+          listingId
+        ).select(
+          "seller title image type price dailyRate maxDays status"
+        )
 
-        paymentRef:
-          paystackRef || null,
+      if (!listing) {
+        return res.status(404).json({
+          message:
+            "Listing not found.",
+        })
+      }
 
-        paymentMethod:
-          selectedPaymentMethod,
+      if (
+        listing.status !==
+        "Active"
+      ) {
+        return res.status(400).json({
+          message:
+            "This listing is no longer available.",
+        })
+      }
+
+      const resolvedSellerId =
+        String(
+          listing.seller
+        )
+
+      if (
+        suppliedSellerId &&
+        String(
+          suppliedSellerId
+        ) !==
+          resolvedSellerId
+      ) {
+        return res.status(400).json({
+          message:
+            "The selected seller does not match the listing.",
+        })
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // AUTHORITATIVE PRICE
+      // ─────────────────────────────────────────────────────────────────────
+
+      const authoritativeAmount =
+        calculateListingAmount(
+          listing,
+          rentalDays
+        )
+
+      if (
+        authoritativeAmount ===
+        null
+      ) {
+        return res.status(400).json({
+          message:
+            listing.type ===
+            "rent"
+              ? "Valid rental days are required."
+              : "This listing does not currently have a valid price.",
+        })
+      }
+
+      if (
+        clientAmount !==
+          undefined &&
+        clientAmount !== null &&
+        !amountsMatch(
+          clientAmount,
+          authoritativeAmount
+        )
+      ) {
+        return res.status(400).json({
+          message:
+            "The order amount does not match the listing price.",
+
+          expectedAmount:
+            authoritativeAmount,
+        })
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // DISCOUNT
+      // ─────────────────────────────────────────────────────────────────────
+
+      let requestedDiscount =
+        Number(
+          discount || 0
+        )
+
+      if (
+        !Number.isFinite(
+          requestedDiscount
+        ) ||
+        requestedDiscount < 0
+      ) {
+        requestedDiscount = 0
+      }
+
+      requestedDiscount =
+        Math.min(
+          requestedDiscount,
+          authoritativeAmount
+        )
+
+      const finalPayableAmount =
+        authoritativeAmount -
+        requestedDiscount
+
+      // ─────────────────────────────────────────────────────────────────────
+      // FEE
+      // ─────────────────────────────────────────────────────────────────────
+
+      const platformFee =
+        calculatePlatformFee(
+          finalPayableAmount
+        )
+
+      const sellerAmount =
+        finalPayableAmount -
+        platformFee
+
+      const buyerId =
+        getOptionalBuyerId(
+          req
+        )
+
+      // ─────────────────────────────────────────────────────────────────────
+      // CREATE PENDING ORDER
+      // ─────────────────────────────────────────────────────────────────────
+
+      const order =
+        await Order.create({
+          buyer:
+            buyerId || null,
+
+          seller:
+            resolvedSellerId,
+
+          listing:
+            listing._id,
+
+          localOrderId:
+            localOrderId ||
+            null,
+
+          type:
+            type ||
+            listing.type ||
+            "product",
+
+          amount:
+            finalPayableAmount,
+
+          platformFee,
+
+          sellerAmount,
+
+          discount:
+            requestedDiscount,
+
+          location:
+            location || null,
+
+          landmark:
+            landmark || null,
+
+          extraInfo:
+            extraInfo || null,
+
+          contactInfo:
+            contactInfo || null,
+
+          payerName:
+            payerName || null,
+
+          payerPhone:
+            payerPhone || null,
+
+          promoCode:
+            promoCode || null,
+
+          deliveryMethod:
+            deliveryMethod ||
+            "pickup",
+
+          paymentMethod:
+            selectedPaymentMethod,
+
+          paymentStatus:
+            "pending",
+
+          fulfillmentStatus:
+            "pending_payment",
+
+          status:
+            "Pending Confirmation",
+
+          rentalDays:
+            listing.type ===
+            "rent"
+              ? Number(
+                  rentalDays
+                )
+              : null,
+        })
+
+      // ─────────────────────────────────────────────────────────────────────
+      // SELLER NOTIFICATION
+      // ─────────────────────────────────────────────────────────────────────
+
+      pushToSeller(
+        req,
+        resolvedSellerId,
+        {
+          orderId:
+            localOrderId ||
+            String(
+              order._id
+            ),
+
+          databaseOrderId:
+            String(
+              order._id
+            ),
+
+          itemTitle:
+            listing.title ||
+            "Item",
+
+          itemImage:
+            listing.image ||
+            null,
+
+          amount:
+            finalPayableAmount,
+
+          buyerName:
+            payerName ||
+            "A buyer",
+
+          buyerContact:
+            contactInfo ||
+            payerPhone ||
+            "",
+
+          location:
+            location || null,
+
+          landmark:
+            landmark || null,
+
+          paymentMethod:
+            selectedPaymentMethod,
+
+          paymentStatus:
+            "pending",
+
+          orderStatus:
+            "Pending Confirmation",
+
+          deliveryMethod:
+            deliveryMethod ||
+            "pickup",
+
+          discount:
+            requestedDiscount,
+
+          promoCode:
+            promoCode || null,
+        }
+      )
+
+      console.log(
+        `Order ${order._id} created | ` +
+          `amount ₵${finalPayableAmount} | ` +
+          `payment ${selectedPaymentMethod} | ` +
+          `state pending`
+      )
+
+      return res.status(201).json({
+        orderId:
+          String(order._id),
+
+        paymentRequired:
+          true,
 
         paymentStatus:
-          "pending",
+          order.paymentStatus,
 
-        orderStatus:
-          "Pending Confirmation",
+        fulfillmentStatus:
+          order.fulfillmentStatus,
 
-        deliveryMethod:
-          deliveryMethod || "pickup",
+        order,
+      })
+    } catch (err) {
+      console.error(
+        "Create order error:",
+        err
+      )
 
-        discount:
-          requestedDiscount,
-
-        promoCode:
-          promoCode || null,
-      }
-    )
-
-    console.log(
-      `🆕 Order ${order._id} created | ` +
-      `localOrderId: ${localOrderId || "none"} | ` +
-      `seller: ${resolvedSellerId} | ` +
-      `amount: ₵${finalPayableAmount} | ` +
-      `payment: ${selectedPaymentMethod} | ` +
-      `state: pending`
-    )
-
-    return res.status(201).json({
-      orderId:
-        String(order._id),
-
-      paymentRequired:
-        true,
-
-      paymentStatus:
-        order.paymentStatus,
-
-      fulfillmentStatus:
-        order.fulfillmentStatus,
-
-      order,
-    })
-  } catch (err) {
-    console.error(
-      "Create order error:",
-      err
-    )
-
-    return res.status(500).json({
-      message:
-        "Unable to create order.",
-    })
+      return res.status(500).json({
+        message:
+          "Unable to create order.",
+      })
+    }
   }
-})
+)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET MY ORDERS
-// GET /api/orders/my
 //
-// AUTHENTICATED BUYER
+// GET /api/orders/my
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.get(
@@ -648,7 +622,8 @@ router.get(
     try {
       const orders =
         await Order.find({
-          buyer: req.user.id,
+          buyer:
+            req.user.id,
         })
           .populate(
             "listing",
@@ -666,7 +641,7 @@ router.get(
     } catch (err) {
       console.error(
         "Get buyer orders error:",
-        err.message
+        err
       )
 
       res.status(500).json({
@@ -679,9 +654,8 @@ router.get(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET SELLING ORDERS
-// GET /api/orders/selling
 //
-// AUTHENTICATED SELLER
+// GET /api/orders/selling
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.get(
@@ -691,7 +665,8 @@ router.get(
     try {
       const orders =
         await Order.find({
-          seller: req.user.id,
+          seller:
+            req.user.id,
         })
           .populate(
             "listing",
@@ -709,7 +684,7 @@ router.get(
     } catch (err) {
       console.error(
         "Get seller orders error:",
-        err.message
+        err
       )
 
       res.status(500).json({
@@ -722,17 +697,10 @@ router.get(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET ALL ORDERS
-// GET /api/orders/all
 //
-// LEGACY ADMIN ENDPOINT
+// LEGACY COMPATIBILITY ENDPOINT
 //
-// NOTE:
-// This is intentionally preserved for compatibility in this patch.
-// We will migrate it to the dedicated admin authorization middleware
-// separately.
-//
-// The previous endpoint only required the normal user JWT.
-// That is NOT acceptable for production.
+// The proper admin order endpoint is /api/admin/orders.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.get(
@@ -762,7 +730,7 @@ router.get(
     } catch (err) {
       console.error(
         "Get all orders error:",
-        err.message
+        err
       )
 
       res.status(500).json({
@@ -775,15 +743,8 @@ router.get(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET ORDER BY LOCAL ID
+//
 // GET /api/orders/by-local-id/:localOrderId
-//
-// PUBLIC
-//
-// Used by the current Order Tracker.
-//
-// IMPORTANT:
-// This endpoint intentionally exposes only customer-safe information.
-// It does NOT expose sensitive payment records or internal accounting.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.get(
@@ -796,7 +757,8 @@ router.get(
 
       if (!localOrderId) {
         return res.status(400).json({
-          message: "ID required.",
+          message:
+            "ID required.",
         })
       }
 
@@ -866,7 +828,7 @@ router.get(
     } catch (err) {
       console.error(
         "Get order by local ID error:",
-        err.message
+        err
       )
 
       res.status(500).json({
@@ -878,19 +840,11 @@ router.get(
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LEGACY CONFIRM-BY-REF
-// PUT /api/orders/confirm-by-ref
+// LEGACY PAYMENT CONFIRMATION
 //
-// SECURITY CHANGE:
+// RETIRED.
 //
-// This endpoint NO LONGER marks an order as Completed.
-//
-// Payment verification belongs to the payment layer.
-//
-// We keep the endpoint temporarily so an old frontend request
-// doesn't accidentally perform a financial operation.
-//
-// It now returns a migration response.
+// Payment verification belongs to /api/payments.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.put(
@@ -900,6 +854,7 @@ router.put(
     return res.status(410).json({
       message:
         "This confirmation method has been retired. Payment must be verified through the payment system.",
+
       code:
         "PAYMENT_CONFIRMATION_MOVED",
     })
@@ -907,18 +862,11 @@ router.put(
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LEGACY CONFIRM DELIVERY
-// PUT /api/orders/:id/confirm-delivery
+// LEGACY DIRECT DELIVERY CONFIRMATION
 //
-// SECURITY CHANGE:
+// RETIRED.
 //
-// A generic authenticated request can NO LONGER mark an order
-// as Completed.
-//
-// Delivery completion will happen through the Delivery + OTP
-// transaction flow.
-//
-// We return 410 instead of silently performing the old behavior.
+// The delivery + OTP system owns fulfillment completion.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.put(
@@ -928,6 +876,7 @@ router.put(
     return res.status(410).json({
       message:
         "Direct order completion has been retired. Delivery must be confirmed through the delivery OTP process.",
+
       code:
         "DIRECT_DELIVERY_CONFIRMATION_MOVED",
     })
@@ -936,20 +885,19 @@ router.put(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CANCEL ORDER
-// PUT /api/orders/:id/cancel
 //
-// AUTHENTICATED BUYER/SELLER
+// PUT /api/orders/:id/cancel
 //
 // IMPORTANT:
 //
-// This does NOT pretend that a refund has happened.
+// pending payment:
+//     → failed
 //
-// If payment was already held in escrow, the order moves to
-// refund_pending.
+// escrow:
+//     → refund_pending
 //
-// An actual refund will be performed by the transaction/refund
-// system.
-//
+// released:
+//     → cannot cancel through this route
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.put(
@@ -974,33 +922,38 @@ router.put(
 
       const isBuyer =
         order.buyer &&
-        String(order.buyer) ===
-          userId
+        String(
+          order.buyer
+        ) === userId
 
       const isSeller =
         order.seller &&
-        String(order.seller) ===
-          userId
+        String(
+          order.seller
+        ) === userId
 
-      if (!isBuyer && !isSeller) {
+      if (
+        !isBuyer &&
+        !isSeller
+      ) {
         return res.status(403).json({
           message:
             "You are not authorized to cancel this order.",
         })
       }
 
-      if (!canCancelOrder(order)) {
+      if (
+        !canCancelOrder(
+          order
+        )
+      ) {
         return res.status(400).json({
           message:
             "This order can no longer be cancelled.",
         })
       }
 
-      /*
-       * If payment has NOT reached escrow, cancellation is
-       * purely a transaction-state cancellation.
-       */
-
+      // No verified money exists yet.
       if (
         order.paymentStatus ===
         "pending"
@@ -1009,13 +962,7 @@ router.put(
           "failed"
       }
 
-      /*
-       * If Silk Road is already holding funds, we must not
-       * claim that they have magically been refunded.
-       *
-       * The refund engine will handle the actual movement.
-       */
-
+      // Money is inside Silk Road's escrow state.
       if (
         order.paymentStatus ===
         "escrow_held"
@@ -1044,12 +991,13 @@ router.put(
           "refund_pending"
             ? "Order cancelled. Refund processing is pending."
             : "Order cancelled.",
+
         order,
       })
     } catch (err) {
       console.error(
         "Cancel order error:",
-        err.message
+        err
       )
 
       res.status(500).json({
@@ -1061,19 +1009,13 @@ router.put(
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CONFIRM RETURN
+// CONFIRM RENTAL RETURN
+//
 // PUT /api/orders/:id/confirm-return
 //
-// RENTAL COMPATIBILITY
+// Rental compatibility.
 //
-// We preserve the existing renter/lender return confirmation
-// flow for now.
-//
-// IMPORTANT:
-//
-// A rental return confirmation is not allowed to override a
-// disputed/refunded/cancelled transaction.
-//
+// Completing a return DOES NOT release money automatically.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.put(
@@ -1098,15 +1040,20 @@ router.put(
 
       const isBuyer =
         order.buyer &&
-        String(order.buyer) ===
-          userId
+        String(
+          order.buyer
+        ) === userId
 
       const isSeller =
         order.seller &&
-        String(order.seller) ===
-          userId
+        String(
+          order.seller
+        ) === userId
 
-      if (!isBuyer && !isSeller) {
+      if (
+        !isBuyer &&
+        !isSeller
+      ) {
         return res.status(403).json({
           message:
             "You are not authorized to confirm this return.",
@@ -1131,13 +1078,15 @@ router.put(
       } = req.body
 
       if (
-        role === "renter" &&
+        role ===
+          "renter" &&
         isBuyer
       ) {
         order.renterConfirmed =
           true
       } else if (
-        role === "lender" &&
+        role ===
+          "lender" &&
         isSeller
       ) {
         order.lenderConfirmed =
@@ -1160,13 +1109,18 @@ router.put(
           new Date()
 
         /*
-         * IMPORTANT:
+         * DO NOT release funds here.
          *
-         * We do NOT automatically mark payment as released
-         * here.
-         *
-         * Financial release belongs to the transaction engine.
+         * Financial state remains separate.
          */
+
+        if (
+          order.paymentStatus ===
+          "escrow_held"
+        ) {
+          order.paymentStatus =
+            "release_pending"
+        }
       }
 
       await order.save()
@@ -1175,7 +1129,7 @@ router.put(
     } catch (err) {
       console.error(
         "Confirm return error:",
-        err.message
+        err
       )
 
       res.status(500).json({
@@ -1185,5 +1139,9 @@ router.put(
     }
   }
 )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EXPORT
+// ─────────────────────────────────────────────────────────────────────────────
 
 export default router
