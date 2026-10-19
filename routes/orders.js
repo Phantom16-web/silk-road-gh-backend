@@ -372,7 +372,18 @@ router.get("/by-local-id/:localOrderId", async (req, res) => {
       return res.status(404).json({ message: "Order not found." })
     }
 
-    return res.json({
+    // Keep public tracking useful without exposing private delivery details.
+    const requesterId = getOptionalBuyerId(req)
+    const isBuyer =
+      requesterId &&
+      order.buyer &&
+      String(order.buyer) === String(requesterId)
+    const isSeller =
+      requesterId &&
+      order.seller &&
+      String(order.seller._id || order.seller) === String(requesterId)
+
+    const response = {
       _id: order._id.toString(),
       localOrderId: order.localOrderId,
       amount: order.amount,
@@ -381,13 +392,18 @@ router.get("/by-local-id/:localOrderId", async (req, res) => {
       fulfillmentStatus: order.fulfillmentStatus,
       paymentMethod: order.paymentMethod,
       deliveryMethod: order.deliveryMethod,
-      location: order.location,
-      landmark: order.landmark,
-      payerName: order.payerName,
       createdAt: order.createdAt,
       listing: order.listing,
       seller: order.seller,
-    })
+    }
+
+    if (isBuyer || isSeller) {
+      response.location = order.location
+      response.landmark = order.landmark
+      response.payerName = order.payerName
+    }
+
+    return res.json(response)
   } catch (err) {
     console.error("Get order by local ID error:", err)
 
