@@ -5,6 +5,7 @@ import crypto from "crypto"
 import Delivery from "../models/Delivery.js"
 import Rider from "../models/Rider.js"
 import Order from "../models/Order.js"
+import { getEnvironmentMode } from "../models/Environment.js"
 
 import {
   haversineKm,
@@ -238,14 +239,13 @@ function buildDeliveryJobPayload(delivery) {
 // independent.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function isPaymentClearedForDelivery(
-  order
-) {
-  return (
-    order &&
-    order.paymentStatus ===
-      "escrow_held"
-  )
+async function isPaymentClearedForDelivery(order) {
+  if (!order || order.paymentStatus !== "escrow_held") return false
+  const mode = await getEnvironmentMode()
+  if (order.environment === "testing") {
+    return mode === "testing" && order.isSimulatedPayment === true
+  }
+  return mode === "live" && order.isSimulatedPayment !== true
 }
 
 function isOrderAlreadyCompleted(
@@ -394,7 +394,10 @@ router.get(
         // Do not expose customer/seller contact details or addresses to every
         // rider browsing the job board. Those details are returned only after
         // the rider has accepted and been assigned the delivery.
-        jobs: jobs.map((job) => buildDeliveryJobPayload(job)),
+        jobs: (await Promise.all(jobs.map(async (job) => {
+          const linkedOrder = await findOrderForDelivery(job)
+          return (await isPaymentClearedForDelivery(linkedOrder)) ? buildDeliveryJobPayload(job) : null
+        }))).filter(Boolean),
         activeDelivery: null,
       })
     } catch (err) {
@@ -802,9 +805,9 @@ router.post(
       // ─────────────────────────────────────────────────────────────────────
 
       if (
-        !isPaymentClearedForDelivery(
+        !(await isPaymentClearedForDelivery(
           order
-        )
+        ))
       ) {
         return res.status(400).json({
           message:
@@ -1070,9 +1073,9 @@ router.put(
       }
 
       if (
-        !isPaymentClearedForDelivery(
+        !(await isPaymentClearedForDelivery(
           order
-        )
+        ))
       ) {
         return res.status(400).json({
           message:
@@ -1397,9 +1400,9 @@ router.put(
       }
 
       if (
-        !isPaymentClearedForDelivery(
+        !(await isPaymentClearedForDelivery(
           order
-        )
+        ))
       ) {
         return res.status(400).json({
           message:
@@ -1529,9 +1532,9 @@ router.put(
       }
 
       if (
-        !isPaymentClearedForDelivery(
+        !(await isPaymentClearedForDelivery(
           order
-        )
+        ))
       ) {
         return res.status(400).json({
           message:
@@ -1845,10 +1848,7 @@ router.put(
       // OTP cannot release an order that isn't actually held in escrow.
       // ─────────────────────────────────────────────────────────────────────
 
-      if (
-        order.paymentStatus !==
-        "escrow_held"
-      ) {
+      if (!(await isPaymentClearedForDelivery(order))) {
         return res.status(400).json({
           message:
             "The order is not in a valid escrow state.",

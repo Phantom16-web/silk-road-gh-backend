@@ -7,6 +7,7 @@ import Rider from "../models/Rider.js"
 import Delivery from "../models/Delivery.js"
 import Admin from "../models/Admin.js"
 import Payment from "../models/Payment.js"
+import { getEnvironmentMode } from "../models/Environment.js"
 
 import {
   requireAdminAuth,
@@ -53,22 +54,27 @@ router.get(
 
           Listing.countDocuments(),
 
-          Order.countDocuments(),
+          Order.countDocuments({ environment: { $ne: "testing" } }),
 
           Rider.countDocuments(),
 
           Order.countDocuments({
             paymentStatus:
               "released",
+              environment: { $ne: "testing" },
+              isSimulatedPayment: { $ne: true },
           }),
 
           Order.countDocuments({
             paymentStatus:
               "escrow_held",
+              environment: { $ne: "testing" },
+              isSimulatedPayment: { $ne: true },
           }),
 
           Order.countDocuments({
-            paymentStatus: {
+            environment: { $ne: "testing" },
+              paymentStatus: {
               $in: [
                 "pending",
                 "failed",
@@ -79,11 +85,15 @@ router.get(
           Order.countDocuments({
             paymentStatus:
               "release_pending",
+              environment: { $ne: "testing" },
+              isSimulatedPayment: { $ne: true },
           }),
 
           Order.countDocuments({
             paymentStatus:
               "refund_pending",
+              environment: { $ne: "testing" },
+              isSimulatedPayment: { $ne: true },
           }),
 
           Delivery.countDocuments(),
@@ -109,6 +119,8 @@ router.get(
             $match: {
               paymentStatus:
                 "released",
+              environment: { $ne: "testing" },
+              isSimulatedPayment: { $ne: true },
             },
           },
 
@@ -147,6 +159,8 @@ router.get(
             $match: {
               paymentStatus:
                 "escrow_held",
+              environment: { $ne: "testing" },
+              isSimulatedPayment: { $ne: true },
             },
           },
 
@@ -176,6 +190,8 @@ router.get(
             $match: {
               paymentStatus:
                 "release_pending",
+              environment: { $ne: "testing" },
+              isSimulatedPayment: { $ne: true },
             },
           },
 
@@ -218,6 +234,8 @@ router.get(
             $match: {
               paymentStatus:
                 "refund_pending",
+              environment: { $ne: "testing" },
+              isSimulatedPayment: { $ne: true },
             },
           },
 
@@ -902,7 +920,15 @@ router.put(
         return res.status(404).json({
           message:
             "Order not found.",
-        })
+        }
+
+      // Test orders must never enter the real financial ledger.
+      if (order.environment === "testing" || order.isSimulatedPayment) {
+        return res.status(403).json({ message: "Simulated orders cannot use real settlement or refund operations." })
+      }
+      if ((await getEnvironmentMode()) !== "live") {
+        return res.status(403).json({ message: "Real financial operations are disabled outside Live Mode." })
+      })
       }
 
       // ─────────────────────────────────────────────────────────────────────
@@ -1183,7 +1209,15 @@ router.put(
         return res.status(404).json({
           message:
             "Order not found.",
-        })
+        }
+
+      // Test orders must never enter the real financial ledger.
+      if (order.environment === "testing" || order.isSimulatedPayment) {
+        return res.status(403).json({ message: "Simulated orders cannot use real settlement or refund operations." })
+      }
+      if ((await getEnvironmentMode()) !== "live") {
+        return res.status(403).json({ message: "Real financial operations are disabled outside Live Mode." })
+      })
       }
 
       if (
@@ -1351,7 +1385,15 @@ router.put(
         return res.status(404).json({
           message:
             "Order not found.",
-        })
+        }
+
+      // Test orders must never enter the real financial ledger.
+      if (order.environment === "testing" || order.isSimulatedPayment) {
+        return res.status(403).json({ message: "Simulated orders cannot use real settlement or refund operations." })
+      }
+      if ((await getEnvironmentMode()) !== "live") {
+        return res.status(403).json({ message: "Real financial operations are disabled outside Live Mode." })
+      })
       }
 
       if (
