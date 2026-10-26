@@ -8,7 +8,16 @@ const schema = new mongoose.Schema({
   paymentMethod: { type: String, enum: ["manual_momo", "paystack"], required: true },
   paymentReference: { type: String, required: true },
   environment: { type: String, enum: ["testing", "live"], required: true },
-  status: { type: String, enum: ["pending", "verified", "cancelled"], default: "pending" },
+  status: { type: String, enum: ["pending", "submitted", "under_review", "verified", "cancelled", "rejected"], default: "pending" },
+  claimTokenHash: { type: String, required: true, select: false },
+  buyerReference: { type: String, default: null, maxlength: 200 },
+  evidenceUrl: { type: String, default: null, maxlength: 1000 },
+  payerName: { type: String, default: null },
+  payerPhone: { type: String, default: null },
+  submittedAt: { type: Date, default: null },
+  verifiedAt: { type: Date, default: null },
+  verifiedBy: { type: String, default: null },
+  verificationNotes: { type: String, default: null },
 }, { timestamps: true })
 schema.index({ buyer: 1, localOrderId: 1 }, { unique: true, partialFilterExpression: { buyer: { $type: "objectId" } } })
 export default mongoose.models.CheckoutGroup || mongoose.model("CheckoutGroup", schema)
