@@ -41,11 +41,40 @@ router.post("/:checkoutId/submit", async (req, res) => {
     if (group.paymentMethod !== "manual_momo") return res.status(409).json({ message: "Wrong payment method." })
     if (group.status === "submitted" || group.status === "under_review") return res.json({ status: group.status, message: "Payment is already submitted for review." })
     if (group.status !== "pending") return res.status(409).json({ message: "Checkout is not awaiting payment submission." })
-    if (group.environment === "testing") return res.status(403).json({ message: "Do not submit real payment evidence for simulated checkouts." })
+    if (group.environment === "testing") return res.status(403).json({
+      code: "TEST_CHECKOUT",
+      message: "This is a test checkout. No Mobile Money payment is required. Use the test-submission option to practice the review workflow.",
+    })
     const changed = await CheckoutGroup.findOneAndUpdate({ _id: group.id, status: "pending" }, { $set: { status: "submitted", buyerReference: buyerReference.trim(), evidenceUrl, submittedAt: new Date() } }, { new: true })
     if (!changed) return res.status(409).json({ message: "Checkout status changed; refresh before retrying." })
     res.json({ status: "submitted", message: "Evidence submitted. Payment is not yet verified." })
   } catch (err) { console.error("Group submission error", err); res.status(500).json({ message: "Could not submit payment evidence." }) }
+})
+
+// Practice the submission/review flow without claiming any real money was sent.
+// This never creates a Payment, VerifiedReceipt, or real escrow balance.
+router.post("/:checkoutId/submit-test", async (req, res) => {
+  try {
+    if (process.env.ENABLE_ENVIRONMENT_SWITCH !== "true" || await getEnvironmentMode() !== "testing")
+      return res.status(403).json({ message: "Test submissions are only available while Testing Mode is enabled." })
+    const group = await CheckoutGroup.findById(req.params.checkoutId).select("+claimTokenHash")
+    if (!group) return res.status(404).json({ message: "Checkout not found." })
+    if (!authorizeClaim(req, group)) return res.status(403).json({ message: "Not authorized." })
+    if (group.environment !== "testing" || group.paymentMethod !== "manual_momo")
+      return res.status(403).json({ message: "Only manual Mobile Money test checkouts are eligible." })
+    if (group.status === "submitted") return res.json({ status: "submitted", simulated: true })
+    if (group.status !== "pending") return res.status(409).json({ message: "This test checkout is no longer pending." })
+    const updated = await CheckoutGroup.findOneAndUpdate(
+      { _id: group.id, environment: "testing", status: "pending" },
+      { $set: { status: "submitted", buyerReference: `TEST-${crypto.randomBytes(6).toString("hex").toUpperCase()}`, submittedAt: new Date() } },
+      { new: true }
+    )
+    if (!updated) return res.status(409).json({ message: "Checkout changed. Refresh." })
+    res.json({ status: "submitted", simulated: true, message: "Practice payment submitted. No money has been sent or verified." })
+  } catch (err) {
+    console.error("Test checkout submission error", err)
+    res.status(500).json({ message: "Could not submit practice checkout." })
+  }
 })
 
 // Admin verification MUST follow an independent check of the actual credited
@@ -148,8 +177,14 @@ router.post("/:checkoutId/request-refund", async (req, res) => {
 // Admin-only queue, deliberately excludes testing and never exposes claim tokens.
 router.get("/admin/submitted", requireAdminAuth, requirePermission("manage_payments"), async (req, res) => {
   try {
-    const groups = await CheckoutGroup.find({ status: "submitted", environment: "live" }).sort({ submittedAt: 1 }).limit(100).lean()
-    res.json({ groups })
+    const [groups, testGroups, livePending, testPending] = await Promise.all([
+      CheckoutGroup.find({ status: "submitted", environment: "live" }).sort({ submittedAt: 1 }).limit(100).lean(),
+      CheckoutGroup.find({ status: "submitted", environment: "testing" }).sort({ submittedAt: -1 }).limit(40).lean(),
+      CheckoutGroup.countDocuments({ status: "pending", environment: "live" }),
+      CheckoutGroup.countDocuments({ status: "pending", environment: "testing" }),
+    ])
+    res.json({ groups, testGroups, counts: { livePending, testPending, liveSubmitted: groups.length, testSubmitted: testGroups.length },
+      note: "Only live submissions can be independently verified as received money. Test submissions are informational." })
   } catch { res.status(500).json({ message: "Could not load verification queue." }) }
 })
 export default router
