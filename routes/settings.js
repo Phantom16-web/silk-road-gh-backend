@@ -1,66 +1,32 @@
 import express from "express"
-import jwt from "jsonwebtoken"
-
+import PaymentSettings, { getPaymentMode } from "../models/PaymentSettings.js"
+import { requireAdminAuth, requireOwner, requireReAuth, logAction } from "../middleware/adminAuth.js"
 const router = express.Router()
-
-// In-memory settings store — survives until server restart
-// For full persistence this would move to a MongoDB Settings collection
-let SITE_SETTINGS = {
-  contactPhone:    "054 388 3608",
-  contactWhatsApp: "233543883608",
-  aboutText:       "Silk Road GH is Ghana's premier student marketplace — built by students, for students. Whether you're buying textbooks, renting equipment, requesting services, or making extra income, Silk Road GH is your go-to campus platform.",
-  privacyText:     "We collect your name, contact information, location data (only during checkout), and transaction history to facilitate buying, selling, and delivery on the platform.",
-  footerTagline:   "Ghana's student marketplace. Buy, sell, rent, and request services — all secured by escrow and powered by MTN MoMo.",
-  deliveryFee:     10,
-  paymentMode:     "manual", // "manual" or "automated"
-}
-
-const verifyAdminToken = (req, res, next) => {
-  const authHeader = req.headers.authorization
-  if (!authHeader) return res.status(401).json({ message: "No token provided." })
-  const token = authHeader.split(" ")[1]
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET)
-    if (!["owner", "superadmin"].includes(decoded.role)) {
-      return res.status(403).json({ message: "Only owner or superadmin can change payment mode." })
-    }
-    req.adminRole = decoded.role
-    next()
-  } catch {
-    return res.status(401).json({ message: "Invalid or expired token." })
-  }
-}
-
-// @route GET /api/settings — public, anyone can read site settings
-router.get("/", (req, res) => {
-  res.json(SITE_SETTINGS)
+// Public metadata only; do not expose keys or credentials.
+const publicSettings = { contactPhone: "054 388 3608", contactWhatsApp: "233543883608", deliveryFee: 10,
+  footerTagline: "Ghana's student marketplace. Buy, sell, rent and request services with Mobile Money.",
+  aboutText: "Silk Road GH connects university students across Ghana.",
+  privacyText: "Contact, order and delivery information is processed to facilitate transactions." }
+router.get("/", async (req, res) => {
+  try { res.json({ ...publicSettings, paymentMode: await getPaymentMode() }) }
+  catch { res.status(503).json({ message: "Payment configuration unavailable." }) }
 })
-
-// @route PUT /api/settings — owner/superadmin only
-router.put("/", verifyAdminToken, (req, res) => {
-  try {
-    const allowedFields = ["contactPhone", "contactWhatsApp", "aboutText", "privacyText", "footerTagline", "deliveryFee", "paymentMode"]
-    for (const field of allowedFields) {
-      if (req.body[field] !== undefined) SITE_SETTINGS[field] = req.body[field]
-    }
-    res.json(SITE_SETTINGS)
-  } catch (err) {
-    res.status(500).json({ message: err.message })
-  }
+router.get("/payment-mode", requireAdminAuth, requireOwner, async (req, res) => {
+  try { res.json({ paymentMode: await getPaymentMode(), paystackAvailable: false }) }
+  catch { res.status(503).json({ message: "Payment configuration unavailable." }) }
 })
-
-// @route PUT /api/settings/payment-mode — owner/superadmin only, dedicated toggle endpoint
-router.put("/payment-mode", verifyAdminToken, (req, res) => {
+router.put("/payment-mode", requireAdminAuth, requireOwner, requireReAuth, async (req, res) => {
+  const mode = req.body?.mode
+  if (!["manual", "paystack"].includes(mode)) return res.status(400).json({ message: "Invalid payment provider." })
+  // Fail closed until verified Paystack initialization, callback and reconciliation are ready.
+  if (mode === "paystack") return res.status(409).json({ message: "Paystack activation is locked until the complete payment verification integration is certified." })
   try {
-    const { mode } = req.body
-    if (!["manual", "automated"].includes(mode)) {
-      return res.status(400).json({ message: "Mode must be 'manual' or 'automated'." })
-    }
-    SITE_SETTINGS.paymentMode = mode
-    res.json({ paymentMode: SITE_SETTINGS.paymentMode, message: `Payment mode switched to ${mode}.` })
-  } catch (err) {
-    res.status(500).json({ message: err.message })
-  }
+    const previous = await getPaymentMode()
+    await PaymentSettings.findByIdAndUpdate("global", { paymentMode: "manual", changedBy: req.adminUser.email, changedAt: new Date() }, { upsert: true, runValidators: true })
+    await logAction(req, "payment_provider_changed", "payment_settings", "global", { from: previous, to: "manual" })
+    res.json({ paymentMode: "manual", paystackAvailable: false })
+  } catch (err) { res.status(500).json({ message: "Unable to save payment settings." }) }
 })
-
+// Generic settings mutation is intentionally not exposed until a properly authenticated,
+// persistent configuration model for non-payment fields is implemented.
 export default router
