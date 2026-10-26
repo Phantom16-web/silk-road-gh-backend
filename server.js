@@ -11,6 +11,7 @@ import { Server } from "socket.io"
 import authRoutes from "./routes/auth.js"
 import listingRoutes from "./routes/listings.js"
 import orderRoutes from "./routes/orders.js"
+import checkoutGroupRoutes from "./routes/checkoutGroups.js"
 import paymentRoutes from "./routes/payments.js"
 import adminRoutes from "./routes/admin.js"
 import adminAuthRoutes from "./routes/adminAuth.js"
@@ -130,6 +131,7 @@ app.use("/api/testing-payments", testingPaymentRoutes)
 
 app.use("/api/auth", authRoutes)
 app.use("/api/listings", listingRoutes)
+app.use("/api/orders/checkout", checkoutGroupRoutes)
 app.use("/api/orders", orderRoutes)
 app.use("/api/payments", paymentRoutes)
 app.use("/api/admin", adminRoutes)
