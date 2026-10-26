@@ -1,3 +1,4 @@
+import mongoose from "mongoose"
 import express from "express"
 
 import User from "../models/User.js"
@@ -905,271 +906,141 @@ router.get(
 
 router.put(
   "/orders/:id/release",
-  requireAnyPermission(
-    "manage_orders",
-    "manage_payments"
-  ),
+  requireAnyPermission("manage_orders", "manage_payments"),
   async (req, res) => {
+    const session = await mongoose.startSession()
+    let result = null
+
     try {
-      const order =
-        await Order.findById(
-          req.params.id
+      // MongoDB transactions require a replica set or sharded cluster.
+      // Fail closed rather than partially modifying financial balances.
+      await session.withTransaction(async () => {
+        const order = await Order.findById(req.params.id).session(session)
+        if (!order) {
+          const err = new Error("Order not found.")
+          err.httpStatus = 404
+          throw err
+        }
+
+        if (order.environment === "testing" || order.isSimulatedPayment) {
+          const err = new Error("Simulated orders cannot use real settlement operations.")
+          err.httpStatus = 403
+          throw err
+        }
+        if ((await getEnvironmentMode()) !== "live") {
+          const err = new Error("Real settlement is disabled outside Live Mode.")
+          err.httpStatus = 403
+          throw err
+        }
+        if (order.paymentStatus !== "release_pending" ||
+            order.fulfillmentStatus !== "completed") {
+          const err = new Error("Order must have completed fulfillment and be awaiting release.")
+          err.httpStatus = 409
+          throw err
+        }
+
+        const delivery = await Delivery.findOne({
+          order: order._id,
+          status: "completed",
+        }).sort({ completedAt: -1, updatedAt: -1 }).session(session)
+
+        const deliveryFee = delivery?.rider ? Number(delivery.deliveryFee) : 0
+        if (!Number.isFinite(deliveryFee) || deliveryFee < 0) {
+          const err = new Error("Invalid rider delivery fee.")
+          err.httpStatus = 409
+          throw err
+        }
+
+        if (delivery?.rider && deliveryFee > 0) {
+          // Atomic conditional decrement protects against insufficient balance.
+          const riderResult = await Rider.updateOne(
+            { _id: delivery.rider, pendingEarnings: { $gte: deliveryFee } },
+            {
+              $inc: {
+                pendingEarnings: -deliveryFee,
+                totalEarned: deliveryFee,
+                totalPaid: deliveryFee,
+              },
+            },
+            { session }
+          )
+          if (riderResult.modifiedCount !== 1) {
+            const err = new Error("Rider pending earnings are insufficient; release stopped.")
+            err.httpStatus = 409
+            throw err
+          }
+        } else if (delivery?.rider) {
+          const riderExists = await Rider.exists({ _id: delivery.rider }).session(session)
+          if (!riderExists) {
+            const err = new Error("Delivery rider record not found.")
+            err.httpStatus = 409
+            throw err
+          }
+        }
+
+        // Compare-and-swap ensures that only one request can release the order.
+        const updatedOrder = await Order.findOneAndUpdate(
+          {
+            _id: order._id,
+            environment: { $ne: "testing" },
+            isSimulatedPayment: { $ne: true },
+            paymentStatus: "release_pending",
+            fulfillmentStatus: "completed",
+          },
+          { $set: { paymentStatus: "released", status: "Completed", releasedAt: new Date() } },
+          { new: true, session, runValidators: true }
         )
-
-      if (!order) {
-        return res.status(404).json({
-          message:
-            "Order not found.",
-        })
-      }
-
-      // Test orders must never enter the real financial ledger.
-      if (order.environment === "testing" || order.isSimulatedPayment) {
-        return res.status(403).json({ message: "Simulated orders cannot use real settlement or refund operations." })
-      }
-      if ((await getEnvironmentMode()) !== "live") {
-        return res.status(403).json({ message: "Real financial operations are disabled outside Live Mode." })
-      }
-
-      // ─────────────────────────────────────────────────────────────────────
-      // FINANCIAL STATE GATE
-      // ─────────────────────────────────────────────────────────────────────
-
-      if (
-        order.paymentStatus !==
-        "release_pending"
-      ) {
-        return res.status(400).json({
-          message:
-            `Order cannot be released from payment state "${order.paymentStatus}".`,
-        })
-      }
-
-      // ─────────────────────────────────────────────────────────────────────
-      // FULFILLMENT STATE GATE
-      // ─────────────────────────────────────────────────────────────────────
-
-      if (
-        order.fulfillmentStatus !==
-        "completed"
-      ) {
-        return res.status(400).json({
-          message:
-            "Order fulfillment has not been completed.",
-        })
-      }
-
-      // ─────────────────────────────────────────────────────────────────────
-      // FIND COMPLETED DELIVERY
-      // ─────────────────────────────────────────────────────────────────────
-
-      const delivery =
-        await Delivery.findOne({
-          order:
-            order._id,
-
-          status:
-            "completed",
-        }).sort({
-          completedAt:
-            -1,
-
-          updatedAt:
-            -1,
-        })
-
-      // ─────────────────────────────────────────────────────────────────────
-      // VALIDATE RIDER FINANCIAL POSITION BEFORE CHANGING ORDER STATE
-      // ─────────────────────────────────────────────────────────────────────
-
-      let rider = null
-      let deliveryFee = 0
-      let riderSettlement = 0
-      let previousPendingEarnings = 0
-
-      if (
-        delivery &&
-        delivery.rider
-      ) {
-        rider =
-          await Rider.findById(
-            delivery.rider
-          )
-
-        if (!rider) {
-          return res.status(409).json({
-            message:
-              "The rider attached to this delivery could not be found. Release stopped to protect the financial ledger.",
-          })
+        if (!updatedOrder) {
+          const err = new Error("Order was modified during settlement. Retry after refreshing.")
+          err.httpStatus = 409
+          throw err
         }
 
-        deliveryFee =
-          Number(
-            delivery.deliveryFee ||
-              0
-          )
-
-        previousPendingEarnings =
-          Number(
-            rider.pendingEarnings ||
-              0
-          )
-
-        if (
-          previousPendingEarnings <
-          deliveryFee
-        ) {
-          return res.status(409).json({
-            message:
-              "Rider pending earnings are lower than the delivery fee. Release stopped to prevent an incomplete rider settlement.",
-          })
-        }
-
-        riderSettlement =
-          deliveryFee
-      }
-
-      // ─────────────────────────────────────────────────────────────────────
-      // RIDER SETTLEMENT
-      //
-      // pendingEarnings → totalEarned
-      //
-      // IMPORTANT:
-      //
-      // totalEarned and totalPaid are NOT touched at delivery completion.
-      // They are touched only when the financial release actually occurs.
-      // ─────────────────────────────────────────────────────────────────────
-
-      if (rider) {
-        rider.pendingEarnings =
-          previousPendingEarnings -
-          riderSettlement
-
-        rider.totalEarned =
-          Number(
-            rider.totalEarned ||
-              0
-          ) +
-          riderSettlement
-
-        rider.totalPaid =
-          Number(
-            rider.totalPaid ||
-              0
-          ) +
-          riderSettlement
-
-        await rider.save()
-      }
-
-      // ─────────────────────────────────────────────────────────────────────
-      // FINAL ORDER FINANCIAL TRANSITION
-      //
-      // release_pending → released
-      // ─────────────────────────────────────────────────────────────────────
-
-      order.paymentStatus =
-        "released"
-
-      order.status =
-        "Completed"
-
-      order.releasedAt =
-        new Date()
-
-      await order.save()
-
-      // ─────────────────────────────────────────────────────────────────────
-      // AUDIT
-      // ─────────────────────────────────────────────────────────────────────
-
-      await logAction(
-        req,
-        "order_released",
-        "order",
-        order._id.toString(),
-        {
-          localOrderId:
-            order.localOrderId,
-
-          amount:
-            Number(
-              order.amount ||
-                0
-            ),
-
-          sellerAmount:
-            Number(
-              order.sellerAmount ||
-                0
-            ),
-
-          platformFee:
-            Number(
-              order.platformFee ||
-                0
-            ),
-
-          paymentMethod:
-            order.paymentMethod,
-
-          previousPaymentStatus:
-            "release_pending",
-
-          paymentStatus:
-            "released",
-
-          deliveryId:
-            delivery?._id ||
-            null,
-
-          riderId:
-            delivery?.rider ||
-            null,
-
+        result = {
+          order: updatedOrder,
+          delivery,
           deliveryFee,
-
-          riderSettlement,
+          riderSettlement: delivery?.rider ? deliveryFee : 0,
         }
-      )
+      })
 
-      res.json({
-        message:
-          "Order released and settlement recorded.",
+      // Audit is intentionally after commit. A failure to write the audit
+      // must not cause the client to retry a committed financial settlement.
+      try {
+        await logAction(req, "order_released", "order", String(result.order._id), {
+          localOrderId: result.order.localOrderId,
+          amount: Number(result.order.amount || 0),
+          sellerAmount: Number(result.order.sellerAmount || 0),
+          platformFee: Number(result.order.platformFee || 0),
+          paymentMethod: result.order.paymentMethod,
+          previousPaymentStatus: "release_pending",
+          paymentStatus: "released",
+          deliveryId: result.delivery?._id || null,
+          riderId: result.delivery?.rider || null,
+          deliveryFee: result.deliveryFee,
+          riderSettlement: result.riderSettlement,
+        })
+      } catch (auditError) {
+        console.error("CRITICAL: Settlement committed but audit write failed:", auditError)
+      }
 
-        order,
-
+      return res.json({
+        message: "Order released and settlement recorded.",
+        order: result.order,
         settlement: {
-          riderId:
-            delivery?.rider ||
-            null,
-
-          riderAmount:
-            riderSettlement,
-
-          sellerAmount:
-            Number(
-              order.sellerAmount ||
-                0
-            ),
-
-          platformFee:
-            Number(
-              order.platformFee ||
-                0
-            ),
+          riderId: result.delivery?.rider || null,
+          riderAmount: result.riderSettlement,
+          sellerAmount: Number(result.order.sellerAmount || 0),
+          platformFee: Number(result.order.platformFee || 0),
         },
       })
     } catch (err) {
-      console.error(
-        "Order release error:",
-        err
-      )
-
-      res.status(500).json({
-        message:
-          err.message,
+      console.error("Order release error:", err)
+      return res.status(err.httpStatus || 503).json({
+        message: err.httpStatus ? err.message : "Settlement could not be completed safely. No partial settlement should be committed.",
       })
+    } finally {
+      await session.endSession()
     }
   }
 )
