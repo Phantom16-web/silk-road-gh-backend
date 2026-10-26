@@ -13,6 +13,7 @@ import listingRoutes from "./routes/listings.js"
 import orderRoutes from "./routes/orders.js"
 import checkoutGroupRoutes from "./routes/checkoutGroups.js"
 import checkoutPaymentRoutes from "./routes/checkoutPayments.js"
+import groupLifecycleRoutes from "./routes/groupLifecycle.js"
 import paymentRoutes from "./routes/payments.js"
 import adminRoutes from "./routes/admin.js"
 import adminAuthRoutes from "./routes/adminAuth.js"
@@ -134,8 +135,59 @@ app.use("/api/auth", authRoutes)
 app.use("/api/listings", listingRoutes)
 app.use("/api/orders/checkout", checkoutGroupRoutes)
 app.use("/api/checkout-payments", checkoutPaymentRoutes)
+app.use("/api/group-lifecycle", groupLifecycleRoutes)
+// A grouped checkout must never be cancelled through a single-order endpoint.
+app.use("/api/orders", async (req, res, next) => {
+  const match = req.path.match(/^\/([0-9a-f]{24})\/cancel$/i)
+  if (req.method !== "PUT" || !match) return next()
+  try {
+    const CheckoutGroup = (await import("./models/CheckoutGroup.js")).default
+    const mongoose = (await import("mongoose")).default
+    if (await CheckoutGroup.exists({ orderIds: new mongoose.Types.ObjectId(match[1]) }))
+      return res.status(409).json({ message: "Grouped orders require group-level cancellation and refund processing.", code: "GROUP_CANCELLATION_REQUIRED" })
+    next()
+  } catch (err) { console.error("Group cancellation guard failed", err); res.status(503).json({ message: "Cancellation safety check unavailable." }) }
+})
+
 app.use("/api/orders", orderRoutes)
+// Prevent legacy single-order payment endpoints from accepting grouped checkout orders.
+// Grouped payments must use /api/checkout-payments and their atomic allocation flow.
+app.use("/api/payments", async (req, res, next) => {
+  const match = req.path.match(/^\/(?:manual|paystack)\/([0-9a-f]{24})(?:\/verify)?$/i)
+  if (!match || !["POST", "PUT", "PATCH"].includes(req.method)) return next()
+  try {
+    const CheckoutGroup = (await import("./models/CheckoutGroup.js")).default
+    const mongoose = (await import("mongoose")).default
+    const orderId = new mongoose.Types.ObjectId(match[1])
+    const group = await CheckoutGroup.exists({ orderIds: orderId })
+    if (group) return res.status(409).json({ message: "Grouped checkout payments must be verified through the checkout-group payment workflow.", code: "GROUP_PAYMENT_REQUIRED" })
+    return next()
+  } catch (err) { console.error("Group payment guard failed", err); return res.status(503).json({ message: "Payment safety check unavailable. Retry later." }) }
+})
+
 app.use("/api/payments", paymentRoutes)
+// Grouped financial and delivery operations must not fall through to legacy
+// single-order handlers. Fail closed until per-seller OTP, payout, refund
+// execution and reconciliation are implemented and integration-tested.
+app.use(["/api/admin", "/api/deliveries"], async (req, res, next) => {
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) return next()
+  try {
+    const CheckoutGroup = (await import("./models/CheckoutGroup.js")).default
+    const mongoose = (await import("mongoose")).default
+    const Delivery = (await import("./models/Delivery.js")).default
+    const values = [req.params?.id, req.body?.orderId, req.body?.order, req.body?.deliveryId,
+      ...req.path.split("/")].filter(x => typeof x === "string" && /^[a-f0-9]{24}$/i.test(x))
+    const orderIds = new Set(values)
+    // Resolve delivery IDs to their underlying orders before allowing mutation.
+    if (req.baseUrl === "/api/deliveries" || req.originalUrl.startsWith("/api/deliveries")) {
+      const deliveries = await Delivery.find({ _id: { $in: values } }).select("order").lean()
+      for (const delivery of deliveries) if (delivery.order) orderIds.add(String(delivery.order))
+    }
+    if (orderIds.size && await CheckoutGroup.exists({ orderIds: { $in: [...orderIds].map(id => new mongoose.Types.ObjectId(id)) } }))
+      return res.status(409).json({ code: "GROUP_LIFECYCLE_LOCKED", message: "Grouped order mutation requires the group-specific lifecycle. Legacy settlement, refund and delivery actions are disabled." })
+    next()
+  } catch (err) { console.error("Group lifecycle guard error", err); res.status(503).json({ message: "Group safety check unavailable; action blocked." }) }
+})
 app.use("/api/admin", adminRoutes)
 app.use("/api/admin-auth", adminAuthRoutes)
 app.use("/api/settings", settingsRoutes)
