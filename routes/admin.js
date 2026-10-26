@@ -920,7 +920,8 @@ router.put(
         return res.status(404).json({
           message:
             "Order not found.",
-        }
+        })
+      }
 
       // Test orders must never enter the real financial ledger.
       if (order.environment === "testing" || order.isSimulatedPayment) {
@@ -928,7 +929,6 @@ router.put(
       }
       if ((await getEnvironmentMode()) !== "live") {
         return res.status(403).json({ message: "Real financial operations are disabled outside Live Mode." })
-      })
       }
 
       // ─────────────────────────────────────────────────────────────────────
@@ -1209,7 +1209,8 @@ router.put(
         return res.status(404).json({
           message:
             "Order not found.",
-        }
+        })
+      }
 
       // Test orders must never enter the real financial ledger.
       if (order.environment === "testing" || order.isSimulatedPayment) {
@@ -1217,7 +1218,6 @@ router.put(
       }
       if ((await getEnvironmentMode()) !== "live") {
         return res.status(403).json({ message: "Real financial operations are disabled outside Live Mode." })
-      })
       }
 
       if (
@@ -1385,7 +1385,8 @@ router.put(
         return res.status(404).json({
           message:
             "Order not found.",
-        }
+        })
+      }
 
       // Test orders must never enter the real financial ledger.
       if (order.environment === "testing" || order.isSimulatedPayment) {
@@ -1393,7 +1394,6 @@ router.put(
       }
       if ((await getEnvironmentMode()) !== "live") {
         return res.status(403).json({ message: "Real financial operations are disabled outside Live Mode." })
-      })
       }
 
       if (
