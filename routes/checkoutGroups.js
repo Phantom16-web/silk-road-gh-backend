@@ -34,6 +34,8 @@ router.post("/", async (req, res) => {
   const buyer = buyerId(req)
   // Prevent replay even for anonymous buyers using a unique server-issued checkout ID.
   const checkoutId = `SC-${crypto.randomUUID()}`
+  const claimToken = crypto.randomBytes(32).toString("hex")
+  const claimTokenHash = crypto.createHash("sha256").update(claimToken).digest("hex")
   try {
     const paymentMode = await getPaymentMode()
     if (paymentMode !== "manual") return res.status(503).json({ message: "The selected payment provider is not available for checkout." })
@@ -80,11 +82,11 @@ router.post("/", async (req, res) => {
         await CheckoutGroup.create([{
           _id: checkoutId, localOrderId, buyer: buyer || null,
           orderIds: groupItems.map(i => i.orderId), amount: total,
-          paymentMethod: "manual_momo", paymentReference, environment,
+          paymentMethod: "manual_momo", paymentReference, environment, claimTokenHash, payerName: payerName.trim(), payerPhone: payerPhone.trim(),
         }], { session })
       })
     } finally { await session.endSession() }
-    return res.status(201).json({ checkoutId, total, subtotal, deliveryFee: 0,
+    return res.status(201).json({ checkoutId, claimToken, total, subtotal, deliveryFee: 0,
       paymentReference, paymentMethod: "manual_momo", paymentStatus: "pending",
       orders: groupItems, environment,
       message: "Seller orders created. Payment has not been verified. Do not treat this response as payment confirmation." })
