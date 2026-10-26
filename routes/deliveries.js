@@ -396,7 +396,7 @@ router.get(
         // the rider has accepted and been assigned the delivery.
         jobs: (await Promise.all(jobs.map(async (job) => {
           const linkedOrder = await findOrderForDelivery(job)
-          return (await isPaymentClearedForDelivery(linkedOrder)) ? buildDeliveryJobPayload(job) : null
+          return (linkedOrder?.environment !== "testing" && await isPaymentClearedForDelivery(linkedOrder)) ? buildDeliveryJobPayload(job) : null
         }))).filter(Boolean),
         activeDelivery: null,
       })
@@ -1080,6 +1080,15 @@ router.put(
         return res.status(400).json({
           message:
             "This order is not financially cleared for delivery.",
+        })
+      }
+
+      // Testing deliveries must not claim a real rider's shared activeDelivery.
+      // Simulated seller/self-delivery remains available for OTP workflow testing.
+      if (order.environment === "testing") {
+        return res.status(403).json({
+          message: "Testing orders cannot be assigned to real rider accounts.",
+          code: "TEST_RIDER_ASSIGNMENT_BLOCKED",
         })
       }
 
