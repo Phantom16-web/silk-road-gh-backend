@@ -3,6 +3,7 @@ import express from "express"
 import jwt from "jsonwebtoken"
 
 import Order from "../models/Order.js"
+import { getEnvironmentMode } from "../models/Environment.js"
 import Listing from "../models/Listing.js"
 import protect from "../middleware/auth.js"
 import {
@@ -213,7 +214,12 @@ router.post("/", async (req, res) => {
     const sellerAmount = finalPayableAmount - platformFee
     const buyerId = getOptionalBuyerId(req)
 
+    // Assign the mode on the server; never trust a client-supplied environment.
+    // A database lookup failure stops order creation rather than guessing.
+    const environment = await getEnvironmentMode()
+
     const order = await Order.create({
+      environment,
       buyer: buyerId || null,
       seller: resolvedSellerId,
       listing: listing._id,
@@ -250,6 +256,7 @@ router.post("/", async (req, res) => {
       landmark: landmark || null,
       paymentMethod: selectedPaymentMethod,
       paymentStatus: "pending",
+      environment,
       orderStatus: "Pending Confirmation",
       deliveryMethod: deliveryMethod || "pickup",
       discount: requestedDiscount,
@@ -265,6 +272,7 @@ router.post("/", async (req, res) => {
       orderId: String(order._id),
       paymentRequired: true,
       paymentStatus: order.paymentStatus,
+      environment: order.environment,
       fulfillmentStatus: order.fulfillmentStatus,
       order,
     })
@@ -391,6 +399,7 @@ router.get("/by-local-id/:localOrderId", async (req, res) => {
       paymentStatus: order.paymentStatus,
       fulfillmentStatus: order.fulfillmentStatus,
       paymentMethod: order.paymentMethod,
+      environment: order.environment || "live",
       deliveryMethod: order.deliveryMethod,
       createdAt: order.createdAt,
       listing: order.listing,
@@ -486,7 +495,7 @@ router.put("/:id/cancel", protect, async (req, res) => {
     return res.json({
       message:
         order.paymentStatus === "refund_pending"
-          ? "Order cancelled. Refund processing is pending."
+          ? (order.environment === "testing" ? "Test order cancelled. No real refund is due." : "Order cancelled. Refund processing is pending.")
           : "Order cancelled.",
       order,
     })
