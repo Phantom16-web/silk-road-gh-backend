@@ -1,3 +1,4 @@
+
 import mongoose from "mongoose"
 
 const orderSchema = new mongoose.Schema(
@@ -37,6 +38,53 @@ const orderSchema = new mongoose.Schema(
     },
 
     // ───────────────────────────────────────────────────────────────────────
+    // ENVIRONMENT — TESTING / LIVE
+    // ───────────────────────────────────────────────────────────────────────
+    //
+    // Every new order must be assigned an environment by the backend
+    // when the order is created.
+    //
+    // Never accept the environment directly from the buyer's request.
+    //
+    // Existing orders without this field are treated as Live orders.
+    //
+    // This field must never be changed after creation.
+    // ───────────────────────────────────────────────────────────────────────
+
+    environment: {
+      type: String,
+      enum: ["testing", "live"],
+      default: "live",
+      required: true,
+      immutable: true,
+      index: true,
+    },
+
+    // Identifies whether the payment is simulated.
+    //
+    // A simulated payment is not actual money held by Silk Road.
+    //
+    // This flag is informational. Financial operations must also
+    // check the order's environment on the backend.
+    isSimulatedPayment: {
+      type: Boolean,
+      default: false,
+    },
+
+    // When a simulated payment was confirmed.
+    simulatedPaymentAt: {
+      type: Date,
+      default: null,
+    },
+
+    // Owner account responsible for simulating the payment.
+    simulatedPaymentBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Owner",
+      default: null,
+    },
+
+    // ───────────────────────────────────────────────────────────────────────
     // FINANCIAL AMOUNTS
     // ───────────────────────────────────────────────────────────────────────
 
@@ -68,16 +116,17 @@ const orderSchema = new mongoose.Schema(
     // PAYMENT
     // ───────────────────────────────────────────────────────────────────────
     //
-    // IMPORTANT:
-    //
     // paymentMethod tells us HOW the buyer intends to pay.
     //
-    // paymentStatus tells us WHERE the money currently stands.
+    // paymentStatus tells us WHERE the transaction stands.
     //
     // These are deliberately separate.
     //
-    // Paystack is therefore NOT the transaction engine.
-    // It is simply one payment provider.
+    // Paystack is not the transaction engine.
+    // It is one payment provider.
+    //
+    // For simulated orders, escrow_held is a TEST state only.
+    // It must never be counted as actual escrow funds.
     // ───────────────────────────────────────────────────────────────────────
 
     paymentMethod: {
@@ -117,6 +166,8 @@ const orderSchema = new mongoose.Schema(
     /*
      * When Silk Road has independently verified that the payment
      * has actually been received/validated.
+     *
+     * This must remain null for simulated payments.
      */
     paymentVerifiedAt: {
       type: Date,
@@ -126,6 +177,8 @@ const orderSchema = new mongoose.Schema(
     /*
      * When Silk Road's accounting/release process actually
      * releases funds.
+     *
+     * Simulated orders must never trigger real payouts.
      */
     releasedAt: {
       type: Date,
@@ -134,6 +187,8 @@ const orderSchema = new mongoose.Schema(
 
     /*
      * When the order's refund is actually completed.
+     *
+     * Simulated refunds must never trigger real transfers.
      */
     refundedAt: {
       type: Date,
@@ -155,7 +210,6 @@ const orderSchema = new mongoose.Schema(
     //
     // paymentStatus     = release_pending
     // fulfillmentStatus = completed
-    //
     // ───────────────────────────────────────────────────────────────────────
 
     fulfillmentStatus: {
@@ -236,11 +290,8 @@ const orderSchema = new mongoose.Schema(
     // LEGACY COMPATIBILITY
     // ───────────────────────────────────────────────────────────────────────
     //
-    // We are NOT deleting these yet.
-    //
-    // Existing routes/frontend code may still reference them.
-    // We'll migrate those routes in the next stage and then remove
-    // the legacy fields once nothing depends on them.
+    // These fields are preserved because existing routes and
+    // frontend code may still reference them.
     // ───────────────────────────────────────────────────────────────────────
 
     status: {
@@ -291,6 +342,26 @@ orderSchema.index({
 orderSchema.index({
   paymentStatus: 1,
   fulfillmentStatus: 1,
+})
+
+// Efficiently separate real and simulated transactions.
+orderSchema.index({
+  environment: 1,
+  paymentStatus: 1,
+  createdAt: -1,
+})
+
+// Prevent accidentally changing an order's environment through save().
+orderSchema.pre("save", function (next) {
+  if (!this.isNew && this.isModified("environment")) {
+    return next(
+      new Error(
+        "An order's environment cannot be changed after creation."
+      )
+    )
+  }
+
+  next()
 })
 
 export default mongoose.models.Order ||
