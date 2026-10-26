@@ -2,6 +2,7 @@
 import express from "express"
 
 import Order from "../models/Order.js"
+import { requireLiveMode } from "../middleware/environment.js"
 import Payment from "../models/Payment.js"
 import User from "../models/User.js"
 
@@ -111,6 +112,7 @@ function safeOrderResponse(order) {
     amount: order.amount,
     paymentMethod: order.paymentMethod,
     paymentStatus: order.paymentStatus,
+    environment: order.environment || "live",
     fulfillmentStatus: order.fulfillmentStatus,
     status: order.status,
   }
@@ -151,7 +153,7 @@ async function restorePaymentAfterVerificationFailure(paymentId) {
 // Manual Mobile Money remains independent of Paystack availability.
 // -----------------------------------------------------------------------------
 
-router.post("/manual/:orderId", protect, async (req, res) => {
+router.post("/manual/:orderId", protect, requireLiveMode, async (req, res) => {
   try {
     const {
       buyerReference = null,
@@ -164,6 +166,25 @@ router.post("/manual/:orderId", protect, async (req, res) => {
     if (!order) {
       return res.status(404).json({ message: "Order not found." })
     }
+
+
+    if (order.environment === "testing" || order.isSimulatedPayment) {
+
+
+      return res.status(403).json({
+
+
+        message: "Test orders cannot use real payment or refund operations.",
+
+
+        code: "TEST_ORDER_REAL_PAYMENT_BLOCKED",
+
+
+      })
+
+
+    }
+
 
     if (
       !order.buyer ||
@@ -198,6 +219,8 @@ router.post("/manual/:orderId", protect, async (req, res) => {
     const claimedOrder = await Order.findOneAndUpdate(
       {
         _id: order._id,
+        environment: { $ne: "testing" },
+        isSimulatedPayment: { $ne: true },
         buyer: req.user.id,
         paymentStatus: { $in: ["pending", "failed"] },
         cancelled: { $ne: true },
@@ -262,13 +285,32 @@ router.post("/manual/:orderId", protect, async (req, res) => {
 // Paystack is optional. Manual Mobile Money must remain available.
 // -----------------------------------------------------------------------------
 
-router.post("/paystack/:orderId", protect, async (req, res) => {
+router.post("/paystack/:orderId", protect, requireLiveMode, async (req, res) => {
   try {
     const order = await Order.findById(req.params.orderId)
 
     if (!order) {
       return res.status(404).json({ message: "Order not found." })
     }
+
+
+    if (order.environment === "testing" || order.isSimulatedPayment) {
+
+
+      return res.status(403).json({
+
+
+        message: "Test orders cannot use real payment or refund operations.",
+
+
+        code: "TEST_ORDER_REAL_PAYMENT_BLOCKED",
+
+
+      })
+
+
+    }
+
 
     if (
       !order.buyer ||
@@ -297,6 +339,8 @@ router.post("/paystack/:orderId", protect, async (req, res) => {
     const claimedOrder = await Order.findOneAndUpdate(
       {
         _id: order._id,
+        environment: { $ne: "testing" },
+        isSimulatedPayment: { $ne: true },
         buyer: req.user.id,
         paymentStatus: { $in: ["pending", "failed"] },
         cancelled: { $ne: true },
@@ -349,6 +393,8 @@ router.post("/paystack/:orderId", protect, async (req, res) => {
     const updatedOrder = await Order.findOneAndUpdate(
       {
         _id: claimedOrder._id,
+        environment: { $ne: "testing" },
+        isSimulatedPayment: { $ne: true },
         buyer: req.user.id,
         paymentStatus: "pending",
         paymentMethod: "paystack",
@@ -399,6 +445,7 @@ router.post("/paystack/:orderId", protect, async (req, res) => {
 router.post(
   "/paystack/:paymentId/verify",
   protect,
+  requireLiveMode,
   async (req, res) => {
     let claimedPaymentId = null
 
@@ -426,6 +473,25 @@ router.post(
           message: "Associated order no longer exists.",
         })
       }
+
+
+      if (order.environment === "testing" || order.isSimulatedPayment) {
+
+
+        return res.status(403).json({
+
+
+          message: "Test orders cannot use real payment or refund operations.",
+
+
+          code: "TEST_ORDER_REAL_PAYMENT_BLOCKED",
+
+
+        })
+
+
+      }
+
 
       if (
         payment.status === "verified" &&
@@ -506,6 +572,10 @@ router.post(
           await Order.updateOne(
             {
               _id: order._id,
+          environment: { $ne: "testing" },
+          isSimulatedPayment: { $ne: true },
+        environment: { $ne: "testing" },
+        isSimulatedPayment: { $ne: true },
               paymentStatus: "pending",
               paymentMethod: "paystack",
               paystackRef: claimedPayment.providerReference,
@@ -550,6 +620,10 @@ router.post(
         await Order.updateOne(
           {
             _id: order._id,
+          environment: { $ne: "testing" },
+          isSimulatedPayment: { $ne: true },
+        environment: { $ne: "testing" },
+        isSimulatedPayment: { $ne: true },
             paymentStatus: "pending",
             paymentMethod: "paystack",
             paystackRef: claimedPayment.providerReference,
@@ -580,6 +654,10 @@ router.post(
         await Order.updateOne(
           {
             _id: order._id,
+          environment: { $ne: "testing" },
+          isSimulatedPayment: { $ne: true },
+        environment: { $ne: "testing" },
+        isSimulatedPayment: { $ne: true },
             paymentStatus: "pending",
             paymentMethod: "paystack",
             paystackRef: claimedPayment.providerReference,
@@ -598,6 +676,10 @@ router.post(
       const escrowOrder = await Order.findOneAndUpdate(
         {
           _id: order._id,
+          environment: { $ne: "testing" },
+          isSimulatedPayment: { $ne: true },
+        environment: { $ne: "testing" },
+        isSimulatedPayment: { $ne: true },
           paymentStatus: "pending",
           paymentMethod: "paystack",
           paystackRef: claimedPayment.providerReference,
@@ -725,6 +807,7 @@ router.put(
   "/manual/:paymentId/verify",
   requireAdminAuth,
   requireAnyPermission("manage_payments"),
+  requireLiveMode,
   async (req, res) => {
     try {
       const payment = await Payment.findById(req.params.paymentId)
@@ -746,6 +829,25 @@ router.put(
           message: "Associated order no longer exists.",
         })
       }
+
+
+      if (order.environment === "testing" || order.isSimulatedPayment) {
+
+
+        return res.status(403).json({
+
+
+          message: "Test orders cannot use real payment or refund operations.",
+
+
+          code: "TEST_ORDER_REAL_PAYMENT_BLOCKED",
+
+
+        })
+
+
+      }
+
 
       if (
         payment.status === "verified" &&
@@ -792,6 +894,10 @@ router.put(
       const escrowOrder = await Order.findOneAndUpdate(
         {
           _id: order._id,
+          environment: { $ne: "testing" },
+          isSimulatedPayment: { $ne: true },
+        environment: { $ne: "testing" },
+        isSimulatedPayment: { $ne: true },
           paymentStatus: "pending",
           paymentMethod: "manual_momo",
           cancelled: { $ne: true },
@@ -881,6 +987,7 @@ router.put(
   "/manual/:paymentId/reject",
   requireAdminAuth,
   requireAnyPermission("manage_payments"),
+  requireLiveMode,
   async (req, res) => {
     try {
       const payment = await Payment.findById(req.params.paymentId)
@@ -915,6 +1022,25 @@ router.put(
           message: "Associated order no longer exists.",
         })
       }
+
+
+      if (order.environment === "testing" || order.isSimulatedPayment) {
+
+
+        return res.status(403).json({
+
+
+          message: "Test orders cannot use real payment or refund operations.",
+
+
+          code: "TEST_ORDER_REAL_PAYMENT_BLOCKED",
+
+
+        })
+
+
+      }
+
 
       if (
         !ACTIVE_PAYMENT_STATUSES.includes(payment.status) ||
@@ -954,6 +1080,10 @@ router.put(
       await Order.updateOne(
         {
           _id: order._id,
+          environment: { $ne: "testing" },
+          isSimulatedPayment: { $ne: true },
+        environment: { $ne: "testing" },
+        isSimulatedPayment: { $ne: true },
           paymentStatus: "pending",
           paymentMethod: "manual_momo",
         },
@@ -1005,6 +1135,7 @@ router.put(
     "manage_refunds",
     "issue_refund_decisions"
   ),
+  requireLiveMode,
   async (req, res) => {
     try {
       const payment = await Payment.findById(req.params.paymentId)
@@ -1020,6 +1151,25 @@ router.put(
           message: "Associated order not found.",
         })
       }
+
+
+      if (order.environment === "testing" || order.isSimulatedPayment) {
+
+
+        return res.status(403).json({
+
+
+          message: "Test orders cannot use real payment or refund operations.",
+
+
+          code: "TEST_ORDER_REAL_PAYMENT_BLOCKED",
+
+
+        })
+
+
+      }
+
 
       if (order.paymentStatus === "refunded") {
         return res.status(409).json({
@@ -1046,6 +1196,10 @@ router.put(
       const claimedOrder = await Order.findOneAndUpdate(
         {
           _id: order._id,
+          environment: { $ne: "testing" },
+          isSimulatedPayment: { $ne: true },
+        environment: { $ne: "testing" },
+        isSimulatedPayment: { $ne: true },
           paymentStatus: order.paymentStatus,
         },
         { $set: { paymentStatus: "refund_pending" } },
@@ -1120,6 +1274,7 @@ router.put(
   "/:paymentId/refund-complete",
   requireAdminAuth,
   requireAnyPermission("manage_refunds"),
+  requireLiveMode,
   async (req, res) => {
     try {
       const payment = await Payment.findById(req.params.paymentId)
@@ -1135,6 +1290,25 @@ router.put(
           message: "Associated order not found.",
         })
       }
+
+
+      if (order.environment === "testing" || order.isSimulatedPayment) {
+
+
+        return res.status(403).json({
+
+
+          message: "Test orders cannot use real payment or refund operations.",
+
+
+          code: "TEST_ORDER_REAL_PAYMENT_BLOCKED",
+
+
+        })
+
+
+      }
+
 
       if (order.paymentStatus !== "refund_pending") {
         return res.status(409).json({
@@ -1162,6 +1336,10 @@ router.put(
       const refundedOrder = await Order.findOneAndUpdate(
         {
           _id: order._id,
+          environment: { $ne: "testing" },
+          isSimulatedPayment: { $ne: true },
+        environment: { $ne: "testing" },
+        isSimulatedPayment: { $ne: true },
           paymentStatus: "refund_pending",
         },
         {
