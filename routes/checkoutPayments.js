@@ -98,6 +98,11 @@ router.put("/:checkoutId/verify", requireAdminAuth, requirePermission("manage_pa
       const network = confirmedNetwork.trim().toUpperCase()
       const recipient = recipientAccount.trim().replace(/\s+/g, "")
       const receiptKey = crypto.createHash("sha256").update(JSON.stringify([network, recipient, normalizedReference])).digest("hex")
+      // Identify the conflict without changing the unique receipt safeguards.
+      const checkoutReceipt = await VerifiedReceipt.findOne({ checkoutId: group.id }).session(session)
+      if (checkoutReceipt) throw Object.assign(new Error("A receipt is already recorded for this checkout. Reconcile its payment state before retrying."), { status: 409, code: "CHECKOUT_RECEIPT_EXISTS" })
+      const reusedReceipt = await VerifiedReceipt.findById(receiptKey).session(session)
+      if (reusedReceipt) throw Object.assign(new Error("This confirmed Mobile Money receipt is already allocated to another checkout. No funds allocated."), { status: 409, code: "RECEIPT_ALREADY_ALLOCATED" })
       await VerifiedReceipt.create([{ _id: receiptKey, checkoutId: group.id, network, recipient,
         reference: normalizedReference, amount: group.amount, verifiedBy: req.adminUser.email }], { session })
       const orders = await Order.find({ _id: { $in: group.orderIds } }).session(session)
@@ -116,7 +121,22 @@ router.put("/:checkoutId/verify", requireAdminAuth, requirePermission("manage_pa
     })
     await logAction(req, "checkout_group_payment_verified", "checkout_group", req.params.checkoutId, { amount: response.total, orderCount: response.orderCount })
     res.json(response)
-  } catch (err) { console.error("Group verification error", err); res.status(err.code === 11000 ? 409 : err.status || 500).json({ message: err.code === 11000 ? "Receipt already used for another checkout. No funds allocated." : err.status ? err.message : "Verification failed. No partial allocation should be accepted." }) }
+  } catch (err) {
+    console.error("Group verification error", {
+      checkoutId: req.params.checkoutId,
+      code: err.code,
+      keyPattern: err.keyPattern,
+      message: err.message,
+    })
+    // Duplicate-key failures can come from the receipt key OR checkoutId uniqueness.
+    // Do not report every E11000 as proof that the reference was used elsewhere.
+    const duplicate = err.code === 11000
+    const code = duplicate ? (err.keyPattern?.checkoutId ? "CHECKOUT_RECEIPT_EXISTS" : err.keyPattern?._id ? "RECEIPT_ALREADY_ALLOCATED" : "DUPLICATE_RECORD") : (err.code || "VERIFICATION_FAILED")
+    const message = duplicate
+      ? (code === "CHECKOUT_RECEIPT_EXISTS" ? "This checkout already has a receipt record. Investigate before retrying." : code === "RECEIPT_ALREADY_ALLOCATED" ? "This receipt was already allocated. No funds allocated." : "A duplicate database record prevented verification. Review server logs; no funds allocated.")
+      : err.status ? err.message : "Verification failed. No partial allocation should be accepted."
+    res.status(duplicate ? 409 : err.status || 500).json({ code, message })
+  }
   finally { await session.endSession() }
 })
 
@@ -148,7 +168,7 @@ router.post("/:checkoutId/cancel", async (req, res) => {
 router.post("/:checkoutId/request-refund", async (req, res) => {
   const reason = req.body?.reason
   if (typeof reason !== "string" || reason.trim().length < 10 || reason.length > 2000)
-    return res.status(400).json({ message: "Provide a reason (10–2000 characters)." })
+    return res.status(400).json({ message: "Provide a reason (10â2000 characters)." })
   const session = await mongoose.startSession()
   try {
     let result
@@ -172,6 +192,27 @@ router.post("/:checkoutId/request-refund", async (req, res) => {
     res.json(result)
   } catch (err) { res.status(err.status || 500).json({ message: err.status ? err.message : "Refund request failed; no partial change committed." }) }
   finally { await session.endSession() }
+})
+
+// Read-only Owner/Admin diagnostic: identifies a recorded receipt for this checkout.
+// Never changes balances or payment status; never exposes a claim token.
+router.get("/admin/receipt-status/:checkoutId", requireAdminAuth, requirePermission("manage_payments"), async (req, res) => {
+  try {
+    const group = await CheckoutGroup.findById(req.params.checkoutId).lean()
+    if (!group) return res.status(404).json({ message: "Checkout not found." })
+    const receipt = await VerifiedReceipt.findOne({ checkoutId: group._id }).lean()
+    const orders = await Order.find({ _id: { $in: group.orderIds } }).select("paymentStatus fulfillmentStatus environment").lean()
+    return res.json({
+      checkoutId: group._id, checkoutStatus: group.status, environment: group.environment,
+      receiptRecorded: Boolean(receipt),
+      receipt: receipt ? { recordedAt: receipt.createdAt, amount: receipt.amount, network: receipt.network, recipient: receipt.recipient, reference: receipt.reference } : null,
+      orders: orders.map(o => ({ id: o._id, paymentStatus: o.paymentStatus, fulfillmentStatus: o.fulfillmentStatus, environment: o.environment })),
+      note: "A receipt record does not by itself prove funds were received. Reconcile against the credited MoMo account.",
+    })
+  } catch (err) {
+    console.error("Receipt diagnostic error", err)
+    res.status(500).json({ message: "Unable to inspect receipt status." })
+  }
 })
 
 // Admin-only queue, deliberately excludes testing and never exposes claim tokens.
