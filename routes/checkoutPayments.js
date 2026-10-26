@@ -4,6 +4,7 @@ import crypto from "crypto"
 import CheckoutGroup from "../models/CheckoutGroup.js"
 import Order from "../models/Order.js"
 import Payment from "../models/Payment.js"
+import VerifiedReceipt from "../models/VerifiedReceipt.js"
 import { getEnvironmentMode } from "../models/Environment.js"
 import { requireAdminAuth, requirePermission, logAction } from "../middleware/adminAuth.js"
 
@@ -25,7 +26,7 @@ router.get("/:checkoutId/status", async (req, res) => {
     const group = await CheckoutGroup.findById(req.params.checkoutId).select("+claimTokenHash")
     if (!group) return res.status(404).json({ message: "Checkout not found." })
     if (!authorizeClaim(req, group)) return res.status(403).json({ message: "Not authorized." })
-    res.json({ checkoutId: group.id, status: group.status, paymentStatus: group.status === "verified" ? "escrow_held" : "pending", amount: group.amount, environment: group.environment })
+    res.json({ checkoutId: group.id, status: group.status, paymentStatus: group.status === "verified" ? "escrow_held" : group.status, amount: group.amount, environment: group.environment })
   } catch { res.status(500).json({ message: "Unable to load checkout." }) }
 })
 
@@ -51,8 +52,8 @@ router.post("/:checkoutId/submit", async (req, res) => {
 // Mobile Money account and exact reference, amount, network, and date.
 // A single MongoDB transaction updates all seller orders and allocation records.
 router.put("/:checkoutId/verify", requireAdminAuth, requirePermission("manage_payments"), async (req, res) => {
-  const { confirmedAmount, confirmedReference, notes = "" } = req.body || {}
-  if (!validRef(confirmedReference) || !Number.isFinite(Number(confirmedAmount)) || typeof notes !== "string" || notes.length > 2000) return res.status(400).json({ message: "Verified reference and exact confirmed amount are required." })
+  const { confirmedAmount, confirmedReference, confirmedNetwork, recipientAccount, notes = "" } = req.body || {}
+  if (!validRef(confirmedReference) || !Number.isFinite(Number(confirmedAmount)) || Number(confirmedAmount) <= 0 || !/^[a-z0-9_-]{2,32}$/i.test(String(confirmedNetwork || "")) || !/^[+0-9]{8,18}$/.test(String(recipientAccount || "")) || typeof notes !== "string" || notes.length > 2000) return res.status(400).json({ message: "Verified reference and exact confirmed amount are required." })
   const session = await mongoose.startSession()
   try {
     let response
@@ -62,6 +63,14 @@ router.put("/:checkoutId/verify", requireAdminAuth, requirePermission("manage_pa
       if (group.environment !== "live" || await getEnvironmentMode() !== "live") throw Object.assign(new Error("Real verification is blocked in Testing Mode."), { status: 403 })
       const cents = value => Math.round(Number(value) * 100)
       if (cents(confirmedAmount) !== cents(group.amount) || confirmedReference.trim() !== group.buyerReference) throw Object.assign(new Error("Reference or amount mismatch. Do not verify."), { status: 409 })
+      // The unique _id on VerifiedReceipt is the race-proof replay guard.
+      // A duplicate-key failure aborts the whole MongoDB transaction.
+      const normalizedReference = confirmedReference.trim().replace(/\s+/g, "").toUpperCase()
+      const network = confirmedNetwork.trim().toUpperCase()
+      const recipient = recipientAccount.trim().replace(/\s+/g, "")
+      const receiptKey = crypto.createHash("sha256").update(JSON.stringify([network, recipient, normalizedReference])).digest("hex")
+      await VerifiedReceipt.create([{ _id: receiptKey, checkoutId: group.id, network, recipient,
+        reference: normalizedReference, amount: group.amount, verifiedBy: req.adminUser.email }], { session })
       const orders = await Order.find({ _id: { $in: group.orderIds } }).session(session)
       if (orders.length !== group.orderIds.length || orders.some(o => o.environment !== "live" || o.paymentStatus !== "pending" || o.paymentMethod !== "manual_momo" || o.cancelled || o.fulfillmentStatus !== "pending_payment")) throw Object.assign(new Error("One or more seller orders changed; manual reconciliation required."), { status: 409 })
       if (cents(orders.reduce((sum, o) => sum + o.amount, 0)) !== cents(group.amount)) throw Object.assign(new Error("Seller allocation total mismatch."), { status: 409 })
@@ -78,7 +87,61 @@ router.put("/:checkoutId/verify", requireAdminAuth, requirePermission("manage_pa
     })
     await logAction(req, "checkout_group_payment_verified", "checkout_group", req.params.checkoutId, { amount: response.total, orderCount: response.orderCount })
     res.json(response)
-  } catch (err) { console.error("Group verification error", err); res.status(err.status || 500).json({ message: err.status ? err.message : "Verification failed. No partial allocation should be accepted." }) }
+  } catch (err) { console.error("Group verification error", err); res.status(err.code === 11000 ? 409 : err.status || 500).json({ message: err.code === 11000 ? "Receipt already used for another checkout. No funds allocated." : err.status ? err.message : "Verification failed. No partial allocation should be accepted." }) }
+  finally { await session.endSession() }
+})
+
+
+// Buyer may cancel a wholly unpaid checkout before submitting a receipt.
+// Cancelling after evidence submission requires an administrator to investigate funds.
+router.post("/:checkoutId/cancel", async (req, res) => {
+  const session = await mongoose.startSession()
+  try {
+    let result
+    await session.withTransaction(async () => {
+      const group = await CheckoutGroup.findById(req.params.checkoutId).select("+claimTokenHash").session(session)
+      if (!group) throw Object.assign(new Error("Checkout not found."), { status: 404 })
+      if (!authorizeClaim(req, group)) throw Object.assign(new Error("Not authorized."), { status: 403 })
+      if (group.status === "cancelled") { result = { status: "cancelled" }; return }
+      if (group.status !== "pending") throw Object.assign(new Error("Payment evidence submitted or payment verified. Contact support; do not cancel individual orders."), { status: 409 })
+      const updated = await Order.updateMany({ _id: { $in: group.orderIds }, paymentStatus: "pending", fulfillmentStatus: "pending_payment", cancelled: { $ne: true } },
+        { $set: { cancelled: true, cancelledAt: new Date(), fulfillmentStatus: "cancelled", paymentStatus: "failed", status: "Cancelled" } }, { session })
+      if (updated.modifiedCount !== group.orderIds.length) throw Object.assign(new Error("One or more orders changed. Contact support."), { status: 409 })
+      group.status = "cancelled"; await group.save({ session }); result = { status: "cancelled" }
+    })
+    res.json(result)
+  } catch (err) { res.status(err.status || 500).json({ message: err.status ? err.message : "Cancellation failed; no partial cancellation committed." }) }
+  finally { await session.endSession() }
+})
+
+// Group-wide refund/dispute intake only. This does NOT transfer money or mark a refund complete.
+// All seller allocations are frozen together, in one transaction, for manual reconciliation.
+router.post("/:checkoutId/request-refund", async (req, res) => {
+  const reason = req.body?.reason
+  if (typeof reason !== "string" || reason.trim().length < 10 || reason.length > 2000)
+    return res.status(400).json({ message: "Provide a reason (10–2000 characters)." })
+  const session = await mongoose.startSession()
+  try {
+    let result
+    await session.withTransaction(async () => {
+      const group = await CheckoutGroup.findById(req.params.checkoutId).select("+claimTokenHash").session(session)
+      if (!group) throw Object.assign(new Error("Checkout not found."), { status: 404 })
+      if (!authorizeClaim(req, group)) throw Object.assign(new Error("Not authorized."), { status: 403 })
+      if (group.status === "refund_pending") { result = { status: group.status }; return }
+      if (group.status !== "verified") throw Object.assign(new Error("Only verified checkouts may request a refund; contact support for submitted payments."), { status: 409 })
+      const orders = await Order.find({ _id: { $in: group.orderIds } }).session(session)
+      if (orders.length !== group.orderIds.length || orders.some(o => o.paymentStatus !== "escrow_held" || o.fulfillmentStatus === "completed" || o.environment !== group.environment))
+        throw Object.assign(new Error("Some orders are no longer eligible. Contact support for manual reconciliation."), { status: 409 })
+      const now = new Date()
+      const update = await Order.updateMany({ _id: { $in: group.orderIds }, paymentStatus: "escrow_held" },
+        { $set: { paymentStatus: "refund_pending", fulfillmentStatus: "disputed", status: "Refund Review" } }, { session })
+      if (update.modifiedCount !== orders.length) throw Object.assign(new Error("Order status conflict."), { status: 409 })
+      group.status = "refund_pending"; group.refundRequestedAt = now; group.refundReason = reason.trim()
+      await group.save({ session })
+      result = { status: group.status, checkoutId: group.id, message: "Refund requested. No refund has been issued. Support must reconcile all seller allocations." }
+    })
+    res.json(result)
+  } catch (err) { res.status(err.status || 500).json({ message: err.status ? err.message : "Refund request failed; no partial change committed." }) }
   finally { await session.endSession() }
 })
 
