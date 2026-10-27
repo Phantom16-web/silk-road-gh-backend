@@ -1,3 +1,11 @@
+import authSafetyRoutes from "./routes/authSafety.js"
+import adminLegacySafety from "./routes/adminLegacySafety.js"
+import adminPermissionStudioRoutes from "./routes/adminPermissionStudio.js"
+import adminModerationRoutes from "./routes/adminModeration.js"
+import payoutRoutes from "./routes/payouts.js"
+import payoutRecipientRoutes from "./routes/payoutRecipients.js"
+import { startPaystackInboxWorker } from './services/paystackInboxWorker.js'
+import { startPaystackTransferInboxWorker } from './services/paystackTransferInboxWorker.js'
 import express from "express"
 import mongoose from "mongoose"
 import cors from "cors"
@@ -9,7 +17,9 @@ import { createServer } from "http"
 import { Server } from "socket.io"
 import jwt from "jsonwebtoken"
 import sellerNotificationRoutes from "./routes/sellerNotifications.js"
-import paystackSandboxRoutes from "./routes/paystackSandbox.js"
+import checkoutPaystackRoutes from "./routes/checkoutPaystack.js"
+import paystackWebhookRoutes from "./routes/paystackWebhook.js"
+import checkoutPaystackSafety from "./routes/checkoutPaystackSafety.js"
 import authRoutes from "./routes/auth.js"
 import listingRoutes from "./routes/listings.js"
 import orderRoutes from "./routes/orders.js"
@@ -20,6 +30,8 @@ import paymentRoutes from "./routes/payments.js"
 import adminRoutes from "./routes/admin.js"
 import adminAuthRoutes from "./routes/adminAuth.js"
 import settingsRoutes from "./routes/settings.js"
+import commissionRoutes from "./routes/commission.js"
+import { startCommissionNoticeWorker } from "./services/commissionNoticeWorker.js"
 import promoRoutes from "./routes/promos.js"
 import riderAuthRoutes from "./routes/riderAuth.js"
 import deliveryRoutes from "./routes/deliveries.js"
@@ -40,17 +52,40 @@ function registerSeller(socket, sellerId) {
   socket.data.sellerId = id
   socket.emit("seller_registered", { sellerId: id, socketId: socket.id })
 }
-io.use((socket, next) => {
+io.use(async (socket, next) => {
   const token = socket.handshake.auth?.token
   if (!token) { socket.data.userId = null; return next() }
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET)
     if (!decoded?.id || !mongoose.isValidObjectId(decoded.id)) return next(new Error("Invalid socket token"))
+    const user = await (await import("./models/User.js")).default.findById(decoded.id).select("_id status")
+    if (!user || user.status !== "Active") return next(new Error("Account unavailable"))
     socket.data.userId = String(decoded.id)
     next()
   } catch { next(new Error("Invalid socket token")) }
 })
 io.on("connection", socket => {
+  // Keep an authenticated socket in a per-account room so moderation can
+  // revoke existing connections, not just block future handshakes.
+  if (socket.data.userId) socket.join(`user:${socket.data.userId}`)
+  // Every incoming authenticated event rechecks current account status.
+  // Fail closed if the database is unavailable. No unverified event is handled.
+  socket.use(async (_packet, next) => {
+    if (!socket.data.userId) return next()
+    try {
+      const User = (await import("./models/User.js")).default
+      const user = await User.findById(socket.data.userId).select("status").lean()
+      if (!user || user.status !== "Active") {
+        socket.emit("account_access_revoked", { message: "Account access revoked." })
+        socket.disconnect(true)
+        return next(new Error("Account access revoked"))
+      }
+      next()
+    } catch {
+      socket.disconnect(true)
+      next(new Error("Account status verification unavailable"))
+    }
+  })
   socket.on("register_seller", id => registerSeller(socket, id))
   socket.on("register_rider", id => socket.emit("rider_registered", { riderId: String(id), socketId: socket.id }))
   socket.on("disconnect", () => {
@@ -65,6 +100,7 @@ app.set("io", io)
 app.set("sellerSockets", sellerSockets)
 app.use(helmet())
 app.use(cors({ origin: allowedOrigins, credentials: true }))
+app.use("/api/paystack/webhook", paystackWebhookRoutes)
 app.use(express.json())
 app.use(mongoSanitize())
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: { message: "Too many requests. Please try again later." } })
@@ -72,12 +108,18 @@ app.use("/api/auth", authLimiter)
 app.use("/api/rider-auth", authLimiter)
 const generalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 500, message: { message: "Too many requests. Please try again later." } })
 app.use("/api", generalLimiter)
+app.use("/api/admin-moderation", adminModerationRoutes)
+app.use("/api/admin-permissions", adminPermissionStudioRoutes)
+app.use("/api/owner/payouts", payoutRoutes)
+app.use("/api/payout-recipients", payoutRecipientRoutes)
 app.use("/api/environment", environmentRoutes)
 app.use("/api/testing-payments", testingPaymentRoutes)
-app.use("/api/paystack-sandbox", paystackSandboxRoutes)
+app.use("/api/checkout-paystack", checkoutPaystackRoutes)
+app.use("/api/auth", authSafetyRoutes)
 app.use("/api/auth", authRoutes)
 app.use("/api/listings", listingRoutes)
 app.use("/api/orders/checkout", checkoutGroupRoutes)
+app.use("/api/checkout-payments", checkoutPaystackSafety)
 app.use("/api/checkout-payments", checkoutPaymentRoutes)
 app.use("/api/seller-notifications", sellerNotificationRoutes)
 app.use("/api/group-lifecycle", groupLifecycleRoutes)
@@ -130,9 +172,12 @@ app.use(["/api/admin", "/api/deliveries"], async (req, res, next) => {
     next()
   } catch (err) { console.error("Group lifecycle guard error", err); res.status(503).json({ message: "Group safety check unavailable; action blocked." }) }
 })
+app.use("/api/admin", adminLegacySafety)
 app.use("/api/admin", adminRoutes)
+app.use("/api/admin-auth", adminLegacySafety)
 app.use("/api/admin-auth", adminAuthRoutes)
 app.use("/api/settings", settingsRoutes)
+app.use("/api/commission", commissionRoutes)
 app.use("/api/promos", promoRoutes)
 app.use("/api/rider-auth", riderAuthRoutes)
 app.use("/api/deliveries", deliveryRoutes)
@@ -141,5 +186,8 @@ app.use((req, res) => res.status(404).json({ message: "Route not found" }))
 const PORT = process.env.PORT || 5000
 mongoose.connect(process.env.MONGODB_URI).then(() => {
   console.log("✅ MongoDB Connected")
+  startPaystackInboxWorker()
+  startPaystackTransferInboxWorker()
+  startCommissionNoticeWorker()
   httpServer.listen(PORT, () => console.log(`🚀 Silk Road GH running on port ${PORT} — Socket.io active`))
 }).catch(err => { console.error("❌ MongoDB error:", err.message); process.exit(1) })
