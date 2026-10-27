@@ -162,7 +162,7 @@ router.post("/:checkoutId/cancel", async (req, res) => {
 router.post("/:checkoutId/request-refund", async (req, res) => {
   const reason = req.body?.reason
   if (typeof reason !== "string" || reason.trim().length < 10 || reason.length > 2000)
-    return res.status(400).json({ message: "Provide a reason (10â2000 characters)." })
+    return res.status(400).json({ message: "Provide a reason (10–2000 characters)." })
   const session = await mongoose.startSession()
   try {
     let result
