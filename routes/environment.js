@@ -91,6 +91,50 @@ router.post("/owner/dev-records/purge", requireAdminAuth, requireOwner, requireR
   finally { if (session) await session.endSession() }
 })
 
+// One-time maintenance reset: all legacy orders must be demonstrably free of financial evidence.
+// This endpoint deliberately refuses to bypass the financial safeguards.
+router.post("/owner/reset-development-and-test", requireAdminAuth, requireOwner, requireReAuth, async (req, res) => {
+  if (!cleanupEnabled() || !switchingEnabled()) return res.status(503).json({ message: "Enable both ENABLE_DEV_RECORD_PURGE and ENABLE_ENVIRONMENT_SWITCH during maintenance." })
+  if (req.body?.confirmation !== "DELETE ALL DEVELOPMENT RECORDS AND SWITCH TO TESTING") return res.status(400).json({ message: "Exact irreversible-deletion confirmation required." })
+  if (!String(process.env.PAYSTACK_SECRET_KEY || "").startsWith("sk_test_")) return res.status(409).json({ message: "A Paystack test secret key is required before switching." })
+  let session
+  try {
+    session = await mongoose.startSession()
+    let result
+    await session.withTransaction(async () => {
+      const env = await Environment.findById("global").session(session)
+      if (env && env.mode !== "live") throw new Error("Marketplace must currently be in Live Mode")
+      const orders = await Order.find(legacyFilter).session(session).lean()
+      const ids = orders.map(o => o._id)
+      const idsAsStrings = ids.map(String)
+      // Also protect unlinked payments and checkout groups: they can represent money.
+      const [allPayments, allGroups] = await Promise.all([
+        Payment.countDocuments({}).session(session),
+        CheckoutGroup.countDocuments({ environment: { $ne: "testing" } }).session(session),
+      ])
+      if (allPayments || allGroups) throw new Error(`Deletion refused: ${allPayments} payment records and ${allGroups} live/legacy checkout groups exist. Reconcile them before resetting.`)
+      const evidence = orders.filter(o => o.paystackRef || o.paymentVerifiedAt || o.releasedAt || o.refundedAt)
+      if (evidence.length) throw new Error(`Deletion refused: ${evidence.length} orders contain payment/settlement evidence.`)
+      // Do not delete deliveries that cannot be safely attributed to the selected orders.
+      const linkedDeliveries = ids.length ? await Delivery.find({ order: { $in: ids } }).select("_id").session(session).lean() : []
+      const unlinkedActive = await Delivery.countDocuments({ status: { $in: ["accepted", "picked_up", "delivered"] }, $or: [{ order: null }, { order: { $exists: false } }] }).session(session)
+      if (unlinkedActive) throw new Error(`${unlinkedActive} active deliveries have no order link; inspect before reset.`)
+      const d = ids.length ? await Delivery.deleteMany({ order: { $in: ids } }).session(session) : { deletedCount: 0 }
+      const o = ids.length ? await Order.deleteMany({ _id: { $in: ids }, ...legacyFilter }).session(session) : { deletedCount: 0 }
+      if (o.deletedCount !== ids.length || d.deletedCount !== linkedDeliveries.length) throw new Error("Deletion count mismatch; transaction rolled back")
+      const now = new Date()
+      const updated = await Environment.findOneAndUpdate({ _id: "global", mode: "live" }, { $set: { mode: "testing", changedBy: req.adminUser.email, changedAt: now } }, { new: true, upsert: !env, session, runValidators: true })
+      if (!updated || updated.mode !== "testing") throw new Error("Environment switch failed; deletion rolled back")
+      result = { deletedOrders: o.deletedCount, deletedDeliveries: d.deletedCount, mode: "testing" }
+    })
+    await logAction(req, "owner_development_reset_to_testing", "environment", "global", result)
+    return res.json({ ...result, message: "Development records permanently deleted and environment switched to testing." })
+  } catch (error) {
+    console.error("Owner development reset refused:", error)
+    return res.status(409).json({ message: error.message || "Reset refused; no records deleted." })
+  } finally { if (session) await session.endSession() }
+})
+
 router.put("/mode", requireAdminAuth, requireOwner, requireReAuth, async (req, res) => {
   try {
     if (!switchingEnabled()) return res.status(503).json({ message: "Environment switching is not activated. Complete and verify payment and settlement safeguards first.", code: "ENVIRONMENT_SWITCH_NOT_READY" })
