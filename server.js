@@ -188,13 +188,12 @@ app.use((req, res) => res.status(404).json({ message: "Route not found" }))
 const PORT = process.env.PORT || 5000
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => {
-    console.log("â MongoDB Connected")
+    console.log("✅ MongoDB Connected")
     httpServer.listen(PORT, () => {
-      console.log(`ð Silk Road GH running on port ${PORT} â Socket.io active`)
+      console.log(`🚀 Silk Road GH running on port ${PORT} — Socket.io active`)
     })
   })
   .catch((err) => {
-    console.error("â MongoDB error:", err.message)
+    console.error("❌ MongoDB error:", err.message)
     process.exit(1)
   })
-
