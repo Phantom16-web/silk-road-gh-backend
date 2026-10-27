@@ -5,6 +5,7 @@ import CheckoutGroup from "../models/CheckoutGroup.js"
 import Order from "../models/Order.js"
 import Payment from "../models/Payment.js"
 import VerifiedReceipt from "../models/VerifiedReceipt.js"
+import SellerNotification from "../models/SellerNotification.js"
 import { getEnvironmentMode } from "../models/Environment.js"
 import { requireAdminAuth, requirePermission, logAction } from "../middleware/adminAuth.js"
 
@@ -41,40 +42,27 @@ router.post("/:checkoutId/submit", async (req, res) => {
     if (group.paymentMethod !== "manual_momo") return res.status(409).json({ message: "Wrong payment method." })
     if (group.status === "submitted" || group.status === "under_review") return res.json({ status: group.status, message: "Payment is already submitted for review." })
     if (group.status !== "pending") return res.status(409).json({ message: "Checkout is not awaiting payment submission." })
-    if (group.environment === "testing") return res.status(403).json({
-      code: "TEST_CHECKOUT",
-      message: "This is a test checkout. No Mobile Money payment is required. Use the test-submission option to practice the review workflow.",
-    })
+    if (group.environment === "testing") return res.status(403).json({ code: "TEST_CHECKOUT", message: "This is a test checkout. No Mobile Money payment is required. Use the test-submission option to practice the review workflow." })
     const changed = await CheckoutGroup.findOneAndUpdate({ _id: group.id, status: "pending" }, { $set: { status: "submitted", buyerReference: buyerReference.trim(), evidenceUrl, submittedAt: new Date() } }, { new: true })
     if (!changed) return res.status(409).json({ message: "Checkout status changed; refresh before retrying." })
     res.json({ status: "submitted", message: "Evidence submitted. Payment is not yet verified." })
   } catch (err) { console.error("Group submission error", err); res.status(500).json({ message: "Could not submit payment evidence." }) }
 })
 
-// Practice the submission/review flow without claiming any real money was sent.
-// This never creates a Payment, VerifiedReceipt, or real escrow balance.
+// Practice-only submission: never creates a Payment or real escrow balance.
 router.post("/:checkoutId/submit-test", async (req, res) => {
   try {
-    if (process.env.ENABLE_ENVIRONMENT_SWITCH !== "true" || await getEnvironmentMode() !== "testing")
-      return res.status(403).json({ message: "Test submissions are only available while Testing Mode is enabled." })
+    if (process.env.ENABLE_ENVIRONMENT_SWITCH !== "true" || await getEnvironmentMode() !== "testing") return res.status(403).json({ message: "Test submissions are only available while Testing Mode is enabled." })
     const group = await CheckoutGroup.findById(req.params.checkoutId).select("+claimTokenHash")
     if (!group) return res.status(404).json({ message: "Checkout not found." })
     if (!authorizeClaim(req, group)) return res.status(403).json({ message: "Not authorized." })
-    if (group.environment !== "testing" || group.paymentMethod !== "manual_momo")
-      return res.status(403).json({ message: "Only manual Mobile Money test checkouts are eligible." })
+    if (group.environment !== "testing" || group.paymentMethod !== "manual_momo") return res.status(403).json({ message: "Only manual Mobile Money test checkouts are eligible." })
     if (group.status === "submitted") return res.json({ status: "submitted", simulated: true })
     if (group.status !== "pending") return res.status(409).json({ message: "This test checkout is no longer pending." })
-    const updated = await CheckoutGroup.findOneAndUpdate(
-      { _id: group.id, environment: "testing", status: "pending" },
-      { $set: { status: "submitted", buyerReference: `TEST-${crypto.randomBytes(6).toString("hex").toUpperCase()}`, submittedAt: new Date() } },
-      { new: true }
-    )
+    const updated = await CheckoutGroup.findOneAndUpdate({ _id: group.id, environment: "testing", status: "pending" }, { $set: { status: "submitted", buyerReference: `TEST-${crypto.randomBytes(6).toString("hex").toUpperCase()}`, submittedAt: new Date() } }, { new: true })
     if (!updated) return res.status(409).json({ message: "Checkout changed. Refresh." })
     res.json({ status: "submitted", simulated: true, message: "Practice payment submitted. No money has been sent or verified." })
-  } catch (err) {
-    console.error("Test checkout submission error", err)
-    res.status(500).json({ message: "Could not submit practice checkout." })
-  }
+  } catch (err) { console.error("Test checkout submission error", err); res.status(500).json({ message: "Could not submit practice checkout." }) }
 })
 
 // Admin verification MUST follow an independent check of the actual credited
@@ -86,6 +74,7 @@ router.put("/:checkoutId/verify", requireAdminAuth, requirePermission("manage_pa
   const session = await mongoose.startSession()
   try {
     let response
+    let emittedNotifications = []
     await session.withTransaction(async () => {
       const group = await CheckoutGroup.findById(req.params.checkoutId).session(session)
       if (!group || group.status !== "submitted" || group.paymentMethod !== "manual_momo") throw Object.assign(new Error("Checkout is not awaiting verification."), { status: 409 })
@@ -98,11 +87,10 @@ router.put("/:checkoutId/verify", requireAdminAuth, requirePermission("manage_pa
       const network = confirmedNetwork.trim().toUpperCase()
       const recipient = recipientAccount.trim().replace(/\s+/g, "")
       const receiptKey = crypto.createHash("sha256").update(JSON.stringify([network, recipient, normalizedReference])).digest("hex")
-      // Identify the conflict without changing the unique receipt safeguards.
-      const checkoutReceipt = await VerifiedReceipt.findOne({ checkoutId: group.id }).session(session)
-      if (checkoutReceipt) throw Object.assign(new Error("A receipt is already recorded for this checkout. Reconcile its payment state before retrying."), { status: 409, code: "CHECKOUT_RECEIPT_EXISTS" })
-      const reusedReceipt = await VerifiedReceipt.findById(receiptKey).session(session)
-      if (reusedReceipt) throw Object.assign(new Error("This confirmed Mobile Money receipt is already allocated to another checkout. No funds allocated."), { status: 409, code: "RECEIPT_ALREADY_ALLOCATED" })
+      const existingReceipt = await VerifiedReceipt.findOne({ checkoutId: group.id }).session(session)
+      if (existingReceipt) throw Object.assign(new Error("Receipt already recorded for this checkout"), { status: 409, code: "CHECKOUT_RECEIPT_EXISTS" })
+      const usedReceipt = await VerifiedReceipt.findById(receiptKey).session(session)
+      if (usedReceipt) throw Object.assign(new Error("Receipt already allocated"), { status: 409, code: "RECEIPT_ALREADY_ALLOCATED" })
       await VerifiedReceipt.create([{ _id: receiptKey, checkoutId: group.id, network, recipient,
         reference: normalizedReference, amount: group.amount, verifiedBy: req.adminUser.email }], { session })
       const orders = await Order.find({ _id: { $in: group.orderIds } }).session(session)
@@ -115,28 +103,34 @@ router.put("/:checkoutId/verify", requireAdminAuth, requirePermission("manage_pa
       await Payment.insertMany(payments, { session })
       const updated = await Order.updateMany({ _id: { $in: group.orderIds }, paymentStatus: "pending", environment: "live" }, { $set: { paymentStatus: "escrow_held", paymentVerifiedAt: now, fulfillmentStatus: "awaiting_delivery", status: "In Escrow" } }, { session })
       if (updated.modifiedCount !== orders.length) throw Object.assign(new Error("Seller order update mismatch."), { status: 409 })
+      // Persist seller alerts in the SAME transaction as the verified payment.
+      // Unique (seller, order, type) index prevents duplicate alerts.
+      const alerts = orders.map(o => ({
+        seller: o.seller, order: o._id, type: "new_order", amount: o.amount,
+        paymentMethod: o.paymentMethod, deliveryMethod: o.deliveryMethod || "pickup",
+        itemTitle: "New paid order", status: "unread",
+      }))
+      const savedAlerts = await SellerNotification.insertMany(alerts, { session })
+      emittedNotifications = savedAlerts.map(n => ({
+        id: String(n._id), sellerId: String(n.seller), orderId: String(n.order),
+        itemTitle: n.itemTitle, amount: n.amount, paymentMethod: n.paymentMethod,
+        deliveryMethod: n.deliveryMethod, status: n.status, createdAt: n.createdAt,
+      }))
       group.status = "verified"; group.verifiedAt = now; group.verifiedBy = req.adminUser.email; group.verificationNotes = notes
       await group.save({ session })
       response = { checkoutId: group.id, status: "verified", orderCount: orders.length, total: group.amount }
     })
+    // Socket events are best-effort after commit. Offline sellers retrieve alerts via API.
+    try {
+      const io = req.app.get("io")
+      const sockets = req.app.get("sellerSockets")
+      for (const alert of emittedNotifications) {
+        for (const socketId of sockets?.get(alert.sellerId) || []) io?.to(socketId).emit("new_order", alert)
+      }
+    } catch (err) { console.error("Notification delivery failed; alerts remain persisted", err) }
     await logAction(req, "checkout_group_payment_verified", "checkout_group", req.params.checkoutId, { amount: response.total, orderCount: response.orderCount })
     res.json(response)
-  } catch (err) {
-    console.error("Group verification error", {
-      checkoutId: req.params.checkoutId,
-      code: err.code,
-      keyPattern: err.keyPattern,
-      message: err.message,
-    })
-    // Duplicate-key failures can come from the receipt key OR checkoutId uniqueness.
-    // Do not report every E11000 as proof that the reference was used elsewhere.
-    const duplicate = err.code === 11000
-    const code = duplicate ? (err.keyPattern?.checkoutId ? "CHECKOUT_RECEIPT_EXISTS" : err.keyPattern?._id ? "RECEIPT_ALREADY_ALLOCATED" : "DUPLICATE_RECORD") : (err.code || "VERIFICATION_FAILED")
-    const message = duplicate
-      ? (code === "CHECKOUT_RECEIPT_EXISTS" ? "This checkout already has a receipt record. Investigate before retrying." : code === "RECEIPT_ALREADY_ALLOCATED" ? "This receipt was already allocated. No funds allocated." : "A duplicate database record prevented verification. Review server logs; no funds allocated.")
-      : err.status ? err.message : "Verification failed. No partial allocation should be accepted."
-    res.status(duplicate ? 409 : err.status || 500).json({ code, message })
-  }
+  } catch (err) { console.error("Group verification error", err); res.status(err.code === 11000 ? 409 : err.status || 500).json({ message: err.code === 11000 ? "Receipt already used for another checkout. No funds allocated." : err.status ? err.message : "Verification failed. No partial allocation should be accepted." }) }
   finally { await session.endSession() }
 })
 
@@ -194,38 +188,25 @@ router.post("/:checkoutId/request-refund", async (req, res) => {
   finally { await session.endSession() }
 })
 
-// Read-only Owner/Admin diagnostic: identifies a recorded receipt for this checkout.
-// Never changes balances or payment status; never exposes a claim token.
+// Admin-only queue, deliberately excludes testing and never exposes claim tokens.
+// Admin receipt diagnostic. Read-only; never modifies balances or reveals claim tokens.
 router.get("/admin/receipt-status/:checkoutId", requireAdminAuth, requirePermission("manage_payments"), async (req, res) => {
   try {
     const group = await CheckoutGroup.findById(req.params.checkoutId).lean()
     if (!group) return res.status(404).json({ message: "Checkout not found." })
     const receipt = await VerifiedReceipt.findOne({ checkoutId: group._id }).lean()
     const orders = await Order.find({ _id: { $in: group.orderIds } }).select("paymentStatus fulfillmentStatus environment").lean()
-    return res.json({
-      checkoutId: group._id, checkoutStatus: group.status, environment: group.environment,
-      receiptRecorded: Boolean(receipt),
-      receipt: receipt ? { recordedAt: receipt.createdAt, amount: receipt.amount, network: receipt.network, recipient: receipt.recipient, reference: receipt.reference } : null,
+    res.json({ checkoutId: group._id, checkoutStatus: group.status, environment: group.environment,
+      receiptRecorded: Boolean(receipt), receipt: receipt ? { recordedAt: receipt.createdAt, amount: receipt.amount, network: receipt.network, recipient: receipt.recipient, reference: receipt.reference } : null,
       orders: orders.map(o => ({ id: o._id, paymentStatus: o.paymentStatus, fulfillmentStatus: o.fulfillmentStatus, environment: o.environment })),
-      note: "A receipt record does not by itself prove funds were received. Reconcile against the credited MoMo account.",
-    })
-  } catch (err) {
-    console.error("Receipt diagnostic error", err)
-    res.status(500).json({ message: "Unable to inspect receipt status." })
-  }
+      note: "A receipt record does not by itself prove funds were received. Reconcile against the credited MoMo account." })
+  } catch (err) { console.error("Receipt diagnostic error", err); res.status(500).json({ message: "Unable to inspect receipt status." }) }
 })
 
-// Admin-only queue, deliberately excludes testing and never exposes claim tokens.
 router.get("/admin/submitted", requireAdminAuth, requirePermission("manage_payments"), async (req, res) => {
   try {
-    const [groups, testGroups, livePending, testPending] = await Promise.all([
-      CheckoutGroup.find({ status: "submitted", environment: "live" }).sort({ submittedAt: 1 }).limit(100).lean(),
-      CheckoutGroup.find({ status: "submitted", environment: "testing" }).sort({ submittedAt: -1 }).limit(40).lean(),
-      CheckoutGroup.countDocuments({ status: "pending", environment: "live" }),
-      CheckoutGroup.countDocuments({ status: "pending", environment: "testing" }),
-    ])
-    res.json({ groups, testGroups, counts: { livePending, testPending, liveSubmitted: groups.length, testSubmitted: testGroups.length },
-      note: "Only live submissions can be independently verified as received money. Test submissions are informational." })
+    const groups = await CheckoutGroup.find({ status: "submitted", environment: "live" }).sort({ submittedAt: 1 }).limit(100).lean()
+    res.json({ groups })
   } catch { res.status(500).json({ message: "Could not load verification queue." }) }
 })
 export default router
