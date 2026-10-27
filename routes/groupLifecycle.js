@@ -1,5 +1,9 @@
 import { checkGroup } from "../lib/reconciliationChecks.mjs"
 import express from "express"
+import jwt from "jsonwebtoken"
+import Delivery from "../models/Delivery.js"
+import Rider from "../models/Rider.js"
+import groupRiderFunding from "./groupRiderFunding.js"
 import mongoose from "mongoose"
 import crypto from "crypto"
 import protect from "../middleware/auth.js"
@@ -8,10 +12,12 @@ import CheckoutGroup from "../models/CheckoutGroup.js"
 import Order from "../models/Order.js"
 import GroupFulfillment from "../models/GroupFulfillment.js"
 import GroupTransfer from "../models/GroupTransfer.js"
+import RiderFundingChoice from "../models/RiderFundingChoice.js"
 import GroupAuditEvent from "../models/GroupAuditEvent.js"
 import Payment from "../models/Payment.js"
 import { getEnvironmentMode } from "../models/Environment.js"
 const router = express.Router()
+router.use("/rider-funding", groupRiderFunding)
 const error = (message, status = 409) => Object.assign(new Error(message), { status })
 const digest = value => crypto.createHash("sha256").update(value).digest("hex")
 const money = n => Math.round(Number(n) * 100)
@@ -41,14 +47,25 @@ async function runTransaction(res, callback) {
 // Seller can view only their own grouped orders. Buyer claim tokens are never returned.
 router.get("/seller/orders", protect, async (req,res)=>{
   try {
-    const orders=await Order.find({seller:req.user.id,environment:"live",paymentStatus:{$in:["escrow_held","release_pending","released"]}}).select("_id seller listing amount sellerAmount paymentStatus fulfillmentStatus createdAt").sort({createdAt:-1}).limit(100).lean()
+    const orders=await Order.find({
+      seller:req.user.id,
+      paymentStatus:{$in:["escrow_held","release_pending","released"]}
+    }).select("_id seller listing amount sellerAmount paymentStatus fulfillmentStatus environment createdAt payerName payerPhone location landmark deliveryMethod").sort({createdAt:-1}).limit(200).lean()
     if(!orders.length)return res.json({orders:[]})
-    const groups=await CheckoutGroup.find({orderIds:{$in:orders.map(o=>o._id)},environment:"live"}).select("_id orderIds status").lean()
+    const groups=await CheckoutGroup.find({orderIds:{$in:orders.map(o=>o._id)}}).select("_id orderIds status environment").lean()
     const groupByOrder=new Map()
     for(const group of groups)for(const id of group.orderIds)if(!groupByOrder.has(String(id)))groupByOrder.set(String(id),group)
-    return res.json({orders:orders.filter(o=>groupByOrder.has(String(o._id))).map(o=>({orderId:String(o._id),checkoutId:groupByOrder.get(String(o._id))._id,listingId:String(o.listing),amount:o.amount,sellerAmount:o.sellerAmount,paymentStatus:o.paymentStatus,fulfillmentStatus:o.fulfillmentStatus,groupStatus:groupByOrder.get(String(o._id)).status}))})
+    const results=orders.filter(o=>groupByOrder.has(String(o._id))).map(o=>({
+      orderId:String(o._id),checkoutId:groupByOrder.get(String(o._id))._id,
+      listingId:String(o.listing),amount:o.amount,sellerAmount:o.sellerAmount,
+      paymentStatus:o.paymentStatus,fulfillmentStatus:o.fulfillmentStatus,
+      groupStatus:groupByOrder.get(String(o._id)).status,environment:o.environment,
+      createdAt:o.createdAt,deliveryMethod:o.deliveryMethod
+    }))
+    return res.json({orders:results})
   }catch(e){console.error("Seller grouped orders error",e);return res.status(500).json({message:"Unable to load grouped sales."})}
 })
+
 // Read-only checkout state for the buyer holding the checkout claim token.
 router.get("/:checkoutId/orders", async (req, res) => {
   try {
@@ -175,6 +192,7 @@ router.post("/:checkoutId/orders/:orderId/confirm-delivery", protect, async (req
     if (!group || group.status !== "verified" || group.environment !== "live" || await getEnvironmentMode() !== "live") throw error("Checkout is not eligible.")
     const order = await Order.findOne({ _id: req.params.orderId, seller: req.user.id, paymentStatus: "escrow_held", environment: "live", fulfillmentStatus: { $in: ["awaiting_delivery", "delivery_in_progress", "delivered_pending_otp"] } }).session(session)
     if (!order || !group.orderIds.some(id => String(id) === String(order.id))) throw error("Seller is not authorized for this order.", 403)
+    if (await RiderFundingChoice.exists({order:order._id,status:"dispatched"}).session(session)) throw error("This order has an assigned rider. Use rider delivery confirmation instead.",403)
     const record = await GroupFulfillment.findOne({ order: order._id }).select("+otpHash").session(session)
     if (!record || record.confirmedAt || !record.otpHash || !record.otpExpiresAt || record.otpExpiresAt <= new Date() || record.attempts >= 5) throw error("Delivery code expired or locked. Ask the buyer to generate another.")
     if (!crypto.timingSafeEqual(Buffer.from(record.otpHash, "hex"), Buffer.from(digest(`${group.id}:${order.id}:${req.body.deliveryCode}`), "hex"))) {
@@ -189,6 +207,55 @@ router.post("/:checkoutId/orders/:orderId/confirm-delivery", protect, async (req
     return { verified: true, orderId: order.id, paymentStatus: "release_pending", message: "Delivery confirmed. No payout has been sent yet." }
   })
 })
+// Rider-only lookup. Never return the buyer claim token or OTP.
+router.get("/rider-delivery/:deliveryId/confirmation-context", async (req,res) => {
+  const auth=String(req.headers.authorization||"")
+  let riderId
+  try { if (!auth.startsWith("Bearer ") || !process.env.JWT_SECRET) throw Error(); riderId=jwt.verify(auth.slice(7),process.env.JWT_SECRET)?.id }
+  catch { return res.status(401).json({message:"Rider authentication required."}) }
+  if (!isId(riderId) || !await Rider.exists({_id:riderId,isActive:true,isApproved:true})) return res.status(403).json({message:"Approved rider required."})
+  if (!isId(req.params.deliveryId)) return res.status(400).json({message:"Invalid delivery."})
+  const delivery=await Delivery.findOne({_id:req.params.deliveryId,rider:riderId}).select("order status").lean()
+  if (!delivery?.order) return res.status(404).json({message:"Assigned delivery not found."})
+  const funding=await RiderFundingChoice.findOne({order:delivery.order,deliveryId:delivery._id,status:{$in:["dispatched","delivery_confirmed","rider_paid"]}}).select("checkoutId order").lean()
+  if (!funding) return res.json({grouped:false})
+  return res.json({grouped:true,checkoutId:funding.checkoutId,orderId:String(delivery.order),status:delivery.status})
+})
+
+// Assigned rider confirms the buyer's per-order code. Rider JWTs are checked
+// against the approved Rider collection; seller tokens cannot use this route.
+router.post("/:checkoutId/orders/:orderId/confirm-rider-delivery", async (req,res) => {
+  if (!isId(req.params.orderId) || !/^\d{6}$/.test(String(req.body?.deliveryCode||""))) return res.status(400).json({message:"Order ID and six-digit buyer code required."})
+  const auth = String(req.headers.authorization||"")
+  let riderId
+  try { if (!auth.startsWith("Bearer ") || !process.env.JWT_SECRET) throw Error(); riderId=jwt.verify(auth.slice(7),process.env.JWT_SECRET)?.id }
+  catch { return res.status(401).json({message:"Rider authentication required."}) }
+  if (!isId(riderId) || !await Rider.exists({_id:riderId,isActive:true,isApproved:true})) return res.status(403).json({message:"Approved rider required."})
+  return runTransaction(res,async session=>{
+    const group=await CheckoutGroup.findById(req.params.checkoutId).session(session)
+    if (!group || group.status!=="verified" || group.environment!=="live" || await getEnvironmentMode()!=="live") throw error("Checkout is not eligible.")
+    const order=await Order.findOne({_id:req.params.orderId,paymentStatus:"escrow_held",fulfillmentStatus:"delivered_pending_otp",environment:"live"}).session(session)
+    if (!order || !group.orderIds.some(id=>String(id)===String(order.id))) throw error("Order is not eligible.")
+    const funding=await RiderFundingChoice.findOne({order:order._id,checkoutId:group.id,status:"dispatched"}).session(session)
+    if (!funding?.deliveryId) throw error("No funded rider dispatch for this order.")
+    const delivery=await Delivery.findOne({_id:funding.deliveryId,order:order._id,rider:riderId,status:"delivered"}).session(session)
+    if (!delivery) throw error("Only the assigned rider may confirm this delivery.",403)
+    const record=await GroupFulfillment.findOne({order:order._id}).select("+otpHash").session(session)
+    if (!record || record.confirmedAt || !record.otpHash || !record.otpExpiresAt || record.otpExpiresAt<=new Date() || record.attempts>=5) throw error("Code expired or locked. Ask buyer for a new code.")
+    const expected=digest(`${group.id}:${order.id}:${req.body.deliveryCode}`)
+    if (!crypto.timingSafeEqual(Buffer.from(record.otpHash,"hex"),Buffer.from(expected,"hex"))) {
+      record.attempts++;await record.save({session});return {verified:false,attemptsRemaining:5-record.attempts,message:"Incorrect delivery code."}
+    }
+    const now=new Date()
+    const moved=await Order.updateOne({_id:order._id,paymentStatus:"escrow_held",fulfillmentStatus:"delivered_pending_otp"},{$set:{paymentStatus:"release_pending",fulfillmentStatus:"completed",completedAt:now,status:"Delivery Confirmed — Payout Pending"}},{session})
+    if(moved.modifiedCount!==1) throw error("Order changed during confirmation.")
+    delivery.status="completed";delivery.otpVerified=true;delivery.completedAt=now;delivery.otp=null;await delivery.save({session})
+    funding.status="delivery_confirmed";await funding.save({session})
+    record.confirmedAt=now;record.otpHash=null;await record.save({session})
+    return {verified:true,orderId:order.id,paymentStatus:"release_pending",riderFundingStatus:"delivery_confirmed",message:"Delivery confirmed. Seller and rider payouts are pending independent settlement."}
+  })
+})
+
 // Admin records a seller payout ONLY after independently confirming a real outgoing transfer.
 router.post("/:checkoutId/orders/:orderId/record-payout", requireAdminAuth, requirePermission("manage_payments"), async (req, res) => {
   if (!isId(req.params.orderId) || !validEvidence(req.body || {}) || !Number.isFinite(Number(req.body?.confirmedAmount))) return res.status(400).json({ message: "Valid independent transfer evidence and confirmed amount required." })
@@ -199,12 +266,20 @@ router.post("/:checkoutId/orders/:orderId/record-payout", requireAdminAuth, requ
     if (!order || !group.orderIds.some(id => String(id) === String(order.id))) throw error("Seller order is not ready for payout.")
     const verified = await Payment.findOne({ order: order.id, status: "verified", method: "manual_momo" }).session(session)
     if (!verified) throw error("Verified incoming payment record missing.")
-    if (money(req.body.confirmedAmount) !== money(order.sellerAmount)) throw error("Payout amount must exactly match the seller allocation.")
+    // A rider's reserved allocation is never included in a seller payout.
+    // Until the rider's outgoing transfer is independently recorded, settlement is blocked.
+    const riderFunding = await RiderFundingChoice.findOne({ order: order._id }).session(session)
+    if (riderFunding && riderFunding.status !== "rider_paid") throw error("Rider settlement must be independently verified before seller payout.")
+    const netSellerAmount = riderFunding?.fundingSource === "earnings"
+      ? Math.round((order.sellerAmount - riderFunding.quotedFee) * 100) / 100
+      : order.sellerAmount
+    if (netSellerAmount < 0) throw error("Rider fee exceeds seller allocation.")
+    if (money(req.body.confirmedAmount) !== money(netSellerAmount)) throw error("Payout amount must match the seller allocation after any rider fee.")
     const now = new Date()
-    await GroupTransfer.create([{ checkoutId: group.id, order: order._id, direction: "seller_payout", amount: order.sellerAmount, network: req.body.network.trim().toUpperCase(), recipient: req.body.recipient.trim(), externalReference: req.body.externalReference.trim().toUpperCase(), verifiedBy: req.adminUser.email, verifiedAt: now, notes: req.body.notes || "" }], { session })
+    await GroupTransfer.create([{ checkoutId: group.id, order: order._id, direction: "seller_payout", amount: netSellerAmount, network: req.body.network.trim().toUpperCase(), recipient: req.body.recipient.trim(), externalReference: req.body.externalReference.trim().toUpperCase(), verifiedBy: req.adminUser.email, verifiedAt: now, notes: req.body.notes || "" }], { session })
     const updated = await Order.updateOne({ _id: order._id, paymentStatus: "release_pending", fulfillmentStatus: "completed" }, { $set: { paymentStatus: "released", releasedAt: now, status: "Settled" } }, { session })
     if (updated.modifiedCount !== 1) throw error("Order changed during payout recording.")
-    return { orderId: order.id, paymentStatus: "released", recordedAmount: order.sellerAmount, message: "Externally confirmed payout recorded. This endpoint does not initiate transfers." }
+    return { orderId: order.id, paymentStatus: "released", recordedAmount: netSellerAmount, message: "Externally confirmed payout recorded. This endpoint does not initiate transfers." }
   })
   return result
 })
@@ -217,6 +292,8 @@ router.post("/:checkoutId/record-refund", requireAdminAuth, requirePermission("m
     if (!group || group.status !== "refund_pending" || group.environment !== "live" || await getEnvironmentMode() !== "live") throw error("Checkout is not awaiting a refund.")
     const orders = await Order.find({ _id: { $in: group.orderIds } }).session(session)
     if (orders.length !== group.orderIds.length || orders.some(o => o.paymentStatus !== "refund_pending" || o.environment !== "live" || o.releasedAt)) throw error("Order state conflict. Manual reconciliation required.")
+    const riderCommitments = await RiderFundingChoice.find({ order: { $in: group.orderIds }, status: { $in: ["dispatched", "delivery_confirmed", "rider_paid"] } }).session(session)
+    if (riderCommitments.length) throw error("Rider commitments exist. Finance must reconcile delivery obligations before recording a full refund.")
     if (money(req.body.confirmedAmount) !== money(group.amount) || money(orders.reduce((sum, o) => sum + o.amount, 0)) !== money(group.amount)) throw error("Full refund amount mismatch.")
     const now = new Date()
     await GroupTransfer.create([{ checkoutId: group.id, order: null, direction: "buyer_refund", amount: group.amount, network: req.body.network.trim().toUpperCase(), recipient: req.body.recipient.trim(), externalReference: req.body.externalReference.trim().toUpperCase(), verifiedBy: req.adminUser.email, verifiedAt: now, notes: req.body.notes || "" }], { session })
@@ -228,4 +305,49 @@ router.post("/:checkoutId/record-refund", requireAdminAuth, requirePermission("m
     return { checkoutId: group.id, status: "refunded", amount: group.amount, message: "Externally confirmed full refund recorded. No transfer was initiated by this endpoint." }
   })
 })
+
+// Seller submits independent rider-funding payment evidence. Submission does not prove payment.
+router.post("/rider-funding/:orderId/submit-payment", protect, async (req, res) => {
+  const reference = req.body?.externalReference
+  if (!isId(req.params.orderId) || typeof reference !== "string" || !/^[A-Za-z0-9_-]{6,120}$/.test(reference.trim())) return res.status(400).json({message:"A valid payment reference is required."})
+  try {
+    const choice = await RiderFundingChoice.findOneAndUpdate({order:req.params.orderId,seller:req.user.id,fundingSource:"separate",status:"awaiting_payment"}, {$set:{status:"payment_submitted",paymentReference:reference.trim().toUpperCase()}},{new:true})
+    if (!choice) return res.status(409).json({message:"Separate rider payment is not awaiting submission."})
+    return res.json({status:choice.status,message:"Payment reference submitted. Rider funding is not verified yet."})
+  } catch(e) {return res.status(500).json({message:"Unable to submit rider payment."})}
+})
+
+// Admin records independently verified incoming separate rider funds.
+router.post("/admin/rider-funding/:orderId/verify-payment", requireAdminAuth, requirePermission("manage_payments"), async (req,res) => {
+  if (!isId(req.params.orderId) || !validEvidence(req.body||{}) || !Number.isFinite(Number(req.body?.confirmedAmount))) return res.status(400).json({message:"Verified payment evidence and amount are required."})
+  return runTransaction(res, async session => {
+    const choice = await RiderFundingChoice.findOne({order:req.params.orderId,fundingSource:"separate",status:"payment_submitted"}).session(session)
+    if (!choice || choice.paymentReference !== req.body.externalReference.trim().toUpperCase()) throw error("Payment submission not found or reference differs.")
+    const order = await Order.findOne({_id:choice.order,environment:"live",paymentStatus:"escrow_held"}).session(session)
+    const group = await CheckoutGroup.findById(choice.checkoutId).session(session)
+    if (!order || !group || group.status !== "verified" || await getEnvironmentMode() !== "live") throw error("Order is not eligible for rider funding.")
+    if (money(req.body.confirmedAmount) !== money(choice.quotedFee)) throw error("Confirmed amount differs from quoted fee.")
+    choice.status="funded";choice.paymentVerifiedAt=new Date();await choice.save({session})
+    await GroupAuditEvent.create([{checkoutId:choice.checkoutId,action:"rider_separate_payment_verified",actorType:"admin",actorId:String(req.adminUser._id),details:{orderId:String(order._id),amount:choice.quotedFee,externalReference:choice.paymentReference}}],{session})
+    return {status:"funded",message:"Independent rider payment verification recorded. No rider has been paid."}
+  })
+})
+
+// Finance may record an independently confirmed rider payout after a real delivery.
+// This is a ledger event only; it does not initiate a bank/MoMo transfer.
+router.post("/admin/rider-funding/:orderId/record-rider-payout", requireAdminAuth, requirePermission("manage_payments"), async(req,res)=>{
+  if (!isId(req.params.orderId) || !validEvidence(req.body||{}) || !Number.isFinite(Number(req.body?.confirmedAmount))) return res.status(400).json({message:"Verified outgoing rider transfer evidence is required."})
+  return runTransaction(res, async session => {
+    const choice=await RiderFundingChoice.findOne({order:req.params.orderId,status:"delivery_confirmed"}).session(session)
+    if(!choice) throw error("Rider delivery has not been confirmed.")
+    const order=await Order.findOne({_id:choice.order,paymentStatus:"release_pending",fulfillmentStatus:"completed",environment:"live"}).session(session)
+    const group=await CheckoutGroup.findById(choice.checkoutId).session(session)
+    if(!order || !group || group.status!=="verified" || await getEnvironmentMode()!=="live") throw error("Order not eligible for rider settlement.")
+    if(money(req.body.confirmedAmount)!==money(choice.quotedFee)) throw error("Rider payout must equal the reserved fee.")
+    choice.status="rider_paid";choice.riderPaidAt=new Date();choice.riderPayoutReference=req.body.externalReference.trim().toUpperCase();await choice.save({session})
+    await GroupAuditEvent.create([{checkoutId:choice.checkoutId,action:"rider_payout_recorded",actorType:"admin",actorId:String(req.adminUser._id),details:{orderId:String(order._id),amount:choice.quotedFee,externalReference:choice.riderPayoutReference}}],{session})
+    return {status:"rider_paid",amount:choice.quotedFee,message:"Externally confirmed rider payout recorded; no transfer was initiated."}
+  })
+})
+
 export default router

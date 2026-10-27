@@ -800,6 +800,18 @@ router.post(
         })
       }
 
+      // Grouped checkout uses a separate per-order fulfillment and finance ledger.
+      // The legacy rider endpoint has no reserved rider-fee funding, so do not
+      // create a rider liability or charge an unquoted fee from grouped escrow.
+      const CheckoutGroup = (await import("../models/CheckoutGroup.js")).default
+      const groupedCheckout = await CheckoutGroup.findOne({ orderIds: order._id }).select("_id").lean()
+      if (groupedCheckout) {
+        return res.status(409).json({
+          code: "GROUP_RIDER_FUNDING_REQUIRED",
+          message: "Rider requests for this order need a confirmed delivery quote and funding choice. You can deliver this order yourself while rider payments are being connected."
+        })
+      }
+
       // ─────────────────────────────────────────────────────────────────────
       // FINANCIAL GATE
       // ─────────────────────────────────────────────────────────────────────
@@ -1551,6 +1563,20 @@ router.put(
         })
       }
 
+      // Grouped rider deliveries use the buyer's hashed GroupFulfillment code.
+      // Never generate or disclose the legacy plaintext Delivery.otp.
+      const GroupForDelivered = (await import("../models/CheckoutGroup.js")).default
+      if (delivery.order && await GroupForDelivered.exists({orderIds:delivery.order})) {
+        delivery.status = "delivered"
+        delivery.deliveredAt = new Date()
+        delivery.otp = null
+        delivery.otpExpiresAt = null
+        await delivery.save()
+        order.fulfillmentStatus = "delivered_pending_otp"
+        await order.save()
+        return res.json({message:"Awaiting buyer's secure grouped-order delivery code.",deliveryId:String(delivery._id),status:"delivered",otpRequired:true})
+      }
+
       const otp =
         generateOtp()
 
@@ -1745,6 +1771,13 @@ router.put(
           message:
             "Not your delivery.",
         })
+      }
+
+      // Grouped deliveries use GroupFulfillment's hashed buyer code, never
+      // the legacy Delivery.otp path. No payout or completion via this route.
+      const CheckoutGroupForOtp = (await import("../models/CheckoutGroup.js")).default
+      if (delivery.order && await CheckoutGroupForOtp.exists({orderIds:delivery.order})) {
+        return res.status(409).json({code:"GROUP_OTP_REQUIRED",message:"This grouped delivery requires the buyer's secure order-specific confirmation code."})
       }
 
       if (
