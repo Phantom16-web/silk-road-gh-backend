@@ -91,8 +91,8 @@ router.post("/owner/dev-records/purge", requireAdminAuth, requireOwner, requireR
   finally { if (session) await session.endSession() }
 })
 
-// One-time maintenance reset: all legacy orders must be demonstrably free of financial evidence.
-// This endpoint deliberately refuses to bypass the financial safeguards.
+// One-time development reset. Only pending/failed/unsubmitted artifacts with no
+// settlement evidence may be erased. Never assume a record is fake from its age.
 router.post("/owner/reset-development-and-test", requireAdminAuth, requireOwner, requireReAuth, async (req, res) => {
   if (!cleanupEnabled() || !switchingEnabled()) return res.status(503).json({ message: "Enable both ENABLE_DEV_RECORD_PURGE and ENABLE_ENVIRONMENT_SWITCH during maintenance." })
   if (req.body?.confirmation !== "DELETE ALL DEVELOPMENT RECORDS AND SWITCH TO TESTING") return res.status(400).json({ message: "Exact irreversible-deletion confirmation required." })
@@ -106,29 +106,61 @@ router.post("/owner/reset-development-and-test", requireAdminAuth, requireOwner,
       if (env && env.mode !== "live") throw new Error("Marketplace must currently be in Live Mode")
       const orders = await Order.find(legacyFilter).session(session).lean()
       const ids = orders.map(o => o._id)
-      const idsAsStrings = ids.map(String)
-      // Also protect unlinked payments and checkout groups: they can represent money.
-      const [allPayments, allGroups] = await Promise.all([
-        Payment.countDocuments({}).session(session),
-        CheckoutGroup.countDocuments({ environment: { $ne: "testing" } }).session(session),
+      const [payments, groups, allDeliveries] = await Promise.all([
+        Payment.find({}).session(session).lean(),
+        CheckoutGroup.find({ environment: { $ne: "testing" } }).session(session).lean(),
+        Delivery.find({}).select("_id order localOrderId status").session(session).lean(),
       ])
-      if (allPayments || allGroups) throw new Error(`Deletion refused: ${allPayments} payment records and ${allGroups} live/legacy checkout groups exist. Reconcile them before resetting.`)
-      const evidence = orders.filter(o => o.paystackRef || o.paymentVerifiedAt || o.releasedAt || o.refundedAt)
-      if (evidence.length) throw new Error(`Deletion refused: ${evidence.length} orders contain payment/settlement evidence.`)
-      // Do not delete deliveries that cannot be safely attributed to the selected orders.
-      const linkedDeliveries = ids.length ? await Delivery.find({ order: { $in: ids } }).select("_id").session(session).lean() : []
-      const unlinkedActive = await Delivery.countDocuments({ status: { $in: ["accepted", "picked_up", "delivered"] }, $or: [{ order: null }, { order: { $exists: false } }] }).session(session)
-      if (unlinkedActive) throw new Error(`${unlinkedActive} active deliveries have no order link; inspect before reset.`)
-      const d = ids.length ? await Delivery.deleteMany({ order: { $in: ids } }).session(session) : { deletedCount: 0 }
-      const o = ids.length ? await Order.deleteMany({ _id: { $in: ids }, ...legacyFilter }).session(session) : { deletedCount: 0 }
-      if (o.deletedCount !== ids.length || d.deletedCount !== linkedDeliveries.length) throw new Error("Deletion count mismatch; transaction rolled back")
+      const idSet = new Set(ids.map(String))
+      const orderRefs = new Set(orders.map(o => o.localOrderId).filter(Boolean))
+      const badOrders = orders.filter(o =>
+        o.paystackRef || o.paymentVerifiedAt || o.releasedAt || o.refundedAt ||
+        ["escrow_held", "release_pending", "released", "refund_pending", "refunded", "disputed"].includes(o.paymentStatus) && !o.isSimulatedPayment
+      )
+      if (badOrders.length) throw new Error(`Review required: ${badOrders.length} legacy orders have payment or settlement indicators. No records were deleted.`)
+      const unsafePayments = payments.filter(p =>
+        !idSet.has(String(p.order)) ||
+        !["pending", "failed"].includes(p.status) ||
+        p.providerReference || p.buyerReference || p.evidenceUrl || p.verifiedAt ||
+        p.verificationStartedAt || p.refundRequestedAt || p.refundReference ||
+        p.refundedAt || p.providerData
+      )
+      if (unsafePayments.length) throw new Error(`Review required: ${unsafePayments.length} of ${payments.length} payment records are unlinked or contain payment/provider/verification evidence. No records were deleted.`)
+      const unsafeGroups = groups.filter(g =>
+        !["pending", "cancelled", "rejected"].includes(g.status) ||
+        !Array.isArray(g.orderIds) || !g.orderIds.length ||
+        g.orderIds.some(id => !idSet.has(String(id))) ||
+        !orderRefs.has(g.localOrderId) ||
+        g.buyerReference || g.evidenceUrl || g.submittedAt || g.verifiedAt ||
+        g.refundRequestedAt || g.disputeOpenedAt ||
+        (g.paymentMethod === "paystack" && g.status !== "cancelled" && g.status !== "rejected")
+      )
+      if (unsafeGroups.length) throw new Error(`Review required: ${unsafeGroups.length} of ${groups.length} checkout groups have payment evidence, unsafe status or unlinked orders. No records were deleted.`)
+      const linkedDeliveries = allDeliveries.filter(d => idSet.has(String(d.order)))
+      const orphanActive = allDeliveries.filter(d =>
+        ["accepted", "picked_up", "delivered"].includes(d.status) && !idSet.has(String(d.order))
+      )
+      if (orphanActive.length) throw new Error(`Review required: ${orphanActive.length} active deliveries are not linked to removable legacy orders. No records were deleted.`)
+      // Delete only the reviewed document IDs; do not touch testing records.
+      const paymentIds = payments.map(p => p._id)
+      const groupIds = groups.map(g => g._id)
+      const deliveryIds = linkedDeliveries.map(d => d._id)
+      const dp = paymentIds.length ? await Payment.deleteMany({ _id: { $in: paymentIds } }).session(session) : { deletedCount: 0 }
+      const dg = groupIds.length ? await CheckoutGroup.deleteMany({ _id: { $in: groupIds } }).session(session) : { deletedCount: 0 }
+      const dd = deliveryIds.length ? await Delivery.deleteMany({ _id: { $in: deliveryIds } }).session(session) : { deletedCount: 0 }
+      const od = ids.length ? await Order.deleteMany({ _id: { $in: ids }, ...legacyFilter }).session(session) : { deletedCount: 0 }
+      if (dp.deletedCount !== paymentIds.length || dg.deletedCount !== groupIds.length || dd.deletedCount !== deliveryIds.length || od.deletedCount !== ids.length) throw new Error("Deletion count mismatch; reset rolled back")
       const now = new Date()
-      const updated = await Environment.findOneAndUpdate({ _id: "global", mode: "live" }, { $set: { mode: "testing", changedBy: req.adminUser.email, changedAt: now } }, { new: true, upsert: !env, session, runValidators: true })
-      if (!updated || updated.mode !== "testing") throw new Error("Environment switch failed; deletion rolled back")
-      result = { deletedOrders: o.deletedCount, deletedDeliveries: d.deletedCount, mode: "testing" }
+      const updated = await Environment.findOneAndUpdate(
+        { _id: "global", mode: "live" },
+        { $set: { mode: "testing", changedBy: req.adminUser.email, changedAt: now } },
+        { new: true, upsert: !env, session, runValidators: true }
+      )
+      if (!updated || updated.mode !== "testing") throw new Error("Environment switch failed; reset rolled back")
+      result = { deletedOrders: od.deletedCount, deletedDeliveries: dd.deletedCount, deletedPayments: dp.deletedCount, deletedCheckoutGroups: dg.deletedCount, mode: "testing" }
     })
     await logAction(req, "owner_development_reset_to_testing", "environment", "global", result)
-    return res.json({ ...result, message: "Development records permanently deleted and environment switched to testing." })
+    return res.json({ ...result, message: "Eligible development records permanently deleted and environment switched to testing." })
   } catch (error) {
     console.error("Owner development reset refused:", error)
     return res.status(409).json({ message: error.message || "Reset refused; no records deleted." })
