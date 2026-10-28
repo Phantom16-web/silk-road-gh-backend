@@ -131,6 +131,76 @@ router.post("/owner/reset-development-and-test", requireAdminAuth, requireOwner,
   } finally { if (session) await session.endSession() }
 })
 
+
+// Owner launch readiness. Never return secrets or financial details.
+router.get("/owner/launch-readiness", requireAdminAuth, requireOwner, async (_req, res) => {
+  try {
+    const mode = await getEnvironmentMode()
+    const [orders, deliveries, payments, groups, nonTestOrders, nonTestGroups] = await Promise.all([
+      Order.countDocuments(), Delivery.countDocuments(), Payment.countDocuments(), CheckoutGroup.countDocuments(),
+      Order.countDocuments({ environment: { $ne: "testing" } }),
+      CheckoutGroup.countDocuments({ environment: { $ne: "testing" } }),
+    ])
+    const checks = {
+      testingMode: mode === "testing",
+      switchingEnabled: switchingEnabled(),
+      livePaystackKey: String(process.env.PAYSTACK_SECRET_KEY || "").startsWith("sk_live_"),
+      paystackIntegrationEnabled: process.env.ENABLE_HYBRID_PAYSTACK === "true",
+      noLiveOrLegacyOrders: nonTestOrders === 0,
+      noLiveOrLegacyGroups: nonTestGroups === 0,
+    }
+    return res.json({ mode, checks, canLaunch: Object.values(checks).every(Boolean),
+      counts: { orders, deliveries, payments, checkoutGroups: groups },
+      warning: "This checks the marketplace switch, not Paystack account approval, bank payouts, tax compliance or live end-to-end readiness. Stop all checkout and webhook processing before launch." })
+  } catch (error) {
+    console.error("Launch readiness error:", error)
+    return res.status(503).json({ message: "Unable to inspect launch readiness." })
+  }
+})
+
+// Explicitly delete TESTING transactions only, then switch to Live in one DB transaction.
+// Requires public checkout and payment/webhook workers to be stopped before invocation.
+router.post("/owner/launch-to-live", requireAdminAuth, requireOwner, requireReAuth, async (req, res) => {
+  if (req.body?.confirmation !== "PERMANENTLY DELETE TEST TRANSACTIONS AND GO LIVE")
+    return res.status(400).json({ message: "Exact irreversible launch confirmation required." })
+  if (!switchingEnabled()) return res.status(503).json({ message: "ENABLE_ENVIRONMENT_SWITCH=true is required." })
+  if (process.env.ENABLE_HYBRID_PAYSTACK !== "true" || !String(process.env.PAYSTACK_SECRET_KEY || "").startsWith("sk_live_"))
+    return res.status(409).json({ message: "Enable hybrid Paystack and configure an sk_live_ secret before launching." })
+  let session
+  try {
+    session = await mongoose.startSession()
+    let result
+    await session.withTransaction(async () => {
+      const env = await Environment.findById("global").session(session)
+      if (env?.mode !== "testing") throw new Error("Marketplace must currently be in Testing Mode.")
+      const [nonTestOrders, nonTestGroups] = await Promise.all([
+        Order.countDocuments({ environment: { $ne: "testing" } }).session(session),
+        CheckoutGroup.countDocuments({ environment: { $ne: "testing" } }).session(session),
+      ])
+      if (nonTestOrders || nonTestGroups) throw new Error("Live/legacy records exist; launch reset refuses to delete them.")
+      // This operation is only for a fresh development database with no real funds.
+      const dp = await Payment.deleteMany({}).session(session)
+      const dg = await CheckoutGroup.deleteMany({ environment: "testing" }).session(session)
+      const dd = await Delivery.deleteMany({}).session(session)
+      const od = await Order.deleteMany({ environment: "testing" }).session(session)
+      const now = new Date()
+      const updated = await Environment.findOneAndUpdate(
+        { _id: "global", mode: "testing" },
+        { $set: { mode: "live", changedBy: req.adminUser.email, changedAt: now } },
+        { new: true, runValidators: true, session }
+      )
+      if (!updated) throw new Error("Environment changed concurrently; transaction rolled back.")
+      result = { mode: "live", deletedOrders: od.deletedCount, deletedDeliveries: dd.deletedCount,
+        deletedPayments: dp.deletedCount, deletedCheckoutGroups: dg.deletedCount }
+    })
+    await logAction(req, "owner_testing_to_live_launch", "environment", "global", result)
+    return res.json({ ...result, message: "Testing transactions deleted; marketplace switched to Live Mode. Verify live checkout before reopening." })
+  } catch (error) {
+    console.error("Owner launch-to-live failed:", error)
+    return res.status(409).json({ message: error.message || "Launch failed; transaction rolled back." })
+  } finally { if (session) await session.endSession() }
+})
+
 router.put("/mode", requireAdminAuth, requireOwner, requireReAuth, async (req, res) => {
   try {
     if (!switchingEnabled()) return res.status(503).json({ message: "Environment switching is not activated. Complete and verify payment and settlement safeguards first.", code: "ENVIRONMENT_SWITCH_NOT_READY" })
