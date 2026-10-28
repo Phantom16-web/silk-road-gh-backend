@@ -652,6 +652,80 @@ router.put(
   }
 )
 
+
+// Seller-only identity review for legacy (non-grouped) deliveries.
+// Grouped checkout continues to use groupRiderFunding's transactional workflow.
+async function legacyIdentityDelivery(req, res) {
+  const sellerId = getAnyUserId(req)
+  if (!sellerId) { res.status(401).json({ message: "Seller authentication required." }); return null }
+  const id = req.params.orderId
+  const order = isMongoId(id) ? await Order.findById(id) : await Order.findOne({ localOrderId: id })
+  if (!order) { res.status(404).json({ message: "Order not found." }); return null }
+  if (String(order.seller) !== String(sellerId)) { res.status(403).json({ message: "Seller access required." }); return null }
+  const CheckoutGroup = (await import("../models/CheckoutGroup.js")).default
+  if (await CheckoutGroup.exists({ orderIds: order._id })) {
+    res.status(409).json({ message: "Grouped orders must use the grouped rider verification workflow." }); return null
+  }
+  const delivery = await Delivery.findOne({ order: order._id, seller: sellerId, status: { $in: ["accepted", "picked_up", "delivered", "completed"] } }).sort({ createdAt: -1 })
+  if (!delivery?.rider) { res.status(404).json({ message: "No assigned rider." }); return null }
+  return { order, delivery, sellerId }
+}
+
+router.get("/by-order/:orderId/rider-identity", async (req, res) => {
+  try {
+    const ctx = await legacyIdentityDelivery(req, res)
+    if (!ctx) return
+    const rider = await Rider.findById(ctx.delivery.rider).select("name photoUrl photoReviewStatus isApproved isActive")
+    if (!rider) return res.status(404).json({ message: "Assigned rider not found." })
+    const approved = rider.isApproved && rider.isActive && rider.photoReviewStatus === "approved" && Boolean(rider.photoUrl)
+    return res.json({ deliveryId: String(ctx.delivery._id), status: ctx.delivery.status,
+      verified: Boolean(ctx.delivery.sellerIdentityVerifiedAt), verificationRequired: ctx.delivery.status === "accepted" && !ctx.delivery.sellerIdentityVerifiedAt,
+      rider: { id: String(rider._id), name: rider.name, photoUrl: approved ? rider.photoUrl : null, photoApproved: approved } })
+  } catch (err) { console.error("Legacy rider identity lookup:", err); return res.status(500).json({ message: "Unable to load rider identity." }) }
+})
+
+router.post("/by-order/:orderId/verify-rider", async (req, res) => {
+  try {
+    const ctx = await legacyIdentityDelivery(req, res)
+    if (!ctx) return
+    const { order, delivery, sellerId } = ctx
+    if (delivery.status !== "accepted" || delivery.sellerIdentityVerifiedAt) return res.status(409).json({ message: "Rider is not awaiting identity verification." })
+    const rider = await Rider.findById(delivery.rider)
+    if (!rider?.isActive || !rider.isApproved || rider.photoReviewStatus !== "approved" || !rider.photoUrl)
+      return res.status(409).json({ message: "Rider has no approved photograph. Do not hand over the item." })
+    if (!(await isPaymentClearedForDelivery(order))) return res.status(409).json({ message: "Order payment is not cleared." })
+    const changed = await Delivery.updateOne({ _id: delivery._id, seller: sellerId, rider: rider._id, status: "accepted", sellerIdentityVerifiedAt: null },
+      { $set: { sellerIdentityVerifiedAt: new Date(), sellerIdentityVerifiedBy: sellerId, riderPhotoAtAssignment: rider.photoUrl } })
+    if (changed.modifiedCount !== 1) return res.status(409).json({ message: "Assignment changed. Refresh and retry." })
+    return res.json({ verified: true, message: "Seller confirmed rider identity. Handover permitted." })
+  } catch (err) { console.error("Legacy rider identity verification:", err); return res.status(500).json({ message: "Unable to verify rider." }) }
+})
+
+router.post("/by-order/:orderId/report-rider-mismatch", async (req, res) => {
+  const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : ""
+  if (reason.length < 10 || reason.length > 1000) return res.status(400).json({ message: "Provide a reason between 10 and 1000 characters." })
+  try {
+    const ctx = await legacyIdentityDelivery(req, res)
+    if (!ctx) return
+    const { order, delivery, sellerId } = ctx
+    if (delivery.status !== "accepted") return res.status(409).json({ message: "Contact support: pickup has already started." })
+    const session = await (await import("mongoose")).default.startSession()
+    try {
+      await session.withTransaction(async () => {
+        const changed = await Delivery.updateOne({ _id: delivery._id, status: "accepted", rider: delivery.rider },
+          { $set: { status: "cancelled", identityMismatchReportedAt: new Date(), identityMismatchReason: reason,
+            sellerIdentityVerifiedAt: null, sellerIdentityVerifiedBy: null, riderPhotoAtAssignment: null } }, { session })
+        if (changed.modifiedCount !== 1) throw new Error("Delivery assignment changed.")
+        await Rider.updateOne({ _id: delivery.rider, activeDelivery: delivery._id }, { $set: { activeDelivery: null } }, { session })
+        const moved = await Order.updateOne({ _id: order._id, seller: sellerId, paymentStatus: "escrow_held", fulfillmentStatus: { $in: ["awaiting_delivery", "delivery_in_progress"] } },
+          { $set: { fulfillmentStatus: "awaiting_delivery" } }, { session })
+        if (moved.matchedCount !== 1) throw new Error("Order changed. Contact support.")
+      })
+    } finally { await session.endSession() }
+    return res.json({ reported: true, cancelled: true, message: "Identity mismatch reported. Assignment cancelled before pickup; no payout made." })
+  } catch (err) { console.error("Legacy rider mismatch:", err); return res.status(409).json({ message: "Unable to cancel assignment automatically. Contact support." }) }
+})
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DELIVERY BY ORDER
 // ─────────────────────────────────────────────────────────────────────────────
