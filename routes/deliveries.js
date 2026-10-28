@@ -154,7 +154,7 @@ function hasDeliveryAccess(delivery, userId) {
 
 async function getApprovedRider(riderId) {
   if (!isMongoId(riderId)) return null
-  return Rider.findOne({ _id: riderId, isActive: true, isApproved: true })
+  return Rider.findOne({ _id: riderId, isActive: true, isApproved: true, photoReviewStatus: "approved", photoUrl: { $type: "string", $ne: "" } })
 }
 
 function validCoordinates(lat, lng) {
@@ -1095,13 +1095,12 @@ router.put(
         })
       }
 
-      // Testing deliveries must not claim a real rider's shared activeDelivery.
-      // Simulated seller/self-delivery remains available for OTP workflow testing.
+      // Never assign a real rider account to a simulated order.
       if (order.environment === "testing") {
-        return res.status(403).json({
-          message: "Testing orders cannot be assigned to real rider accounts.",
-          code: "TEST_RIDER_ASSIGNMENT_BLOCKED",
-        })
+        return res.status(403).json({ code: "TEST_RIDER_ASSIGNMENT_BLOCKED", message: "Testing orders cannot be assigned to real rider accounts." })
+      }
+      if (!rider.photoUrl || rider.photoReviewStatus !== "approved") {
+        return res.status(403).json({ message: "An admin-approved rider photograph is required before accepting jobs." })
       }
 
       if (
@@ -1431,13 +1430,20 @@ router.put(
         })
       }
 
-      delivery.status =
-        "picked_up"
-
-      delivery.pickedUpAt =
-        new Date()
-
-      await delivery.save()
+      // The seller must verify the assigned rider's approved face before handover.
+      // Conditional update prevents pickup racing with identity-mismatch cancellation.
+      if (!delivery.sellerIdentityVerifiedAt || !delivery.sellerIdentityVerifiedBy || !delivery.riderPhotoAtAssignment) {
+        return res.status(409).json({ message: "Seller must confirm rider identity before pickup." })
+      }
+      const movedPickup = await Delivery.updateOne({
+        _id: delivery._id, rider: riderId, status: "accepted",
+        sellerIdentityVerifiedAt: { $ne: null }, riderPhotoAtAssignment: { $nin: [null, ""] }
+      }, { $set: { status: "picked_up", pickedUpAt: new Date() } })
+      if (movedPickup.modifiedCount !== 1) {
+        return res.status(409).json({ message: "Delivery assignment changed. Refresh and retry." })
+      }
+      delivery.status = "picked_up"
+      delivery.pickedUpAt = new Date()
 
       order.fulfillmentStatus =
         "delivery_in_progress"
@@ -2016,11 +2022,7 @@ router.put(
 
       const platformFee =
         Number(
-          order.platformFee ??
-            Math.round(
-              orderAmount *
-                0.08
-            )
+          order.platformFee ?? 0
         )
 
       const sellerAmount =
