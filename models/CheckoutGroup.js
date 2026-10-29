@@ -6,6 +6,11 @@ const schema = new mongoose.Schema({
   orderIds: [{ type: mongoose.Schema.Types.ObjectId, ref: "Order" }],
   amount: { type: Number, required: true },
   paymentMethod: { type: String, enum: ["manual_momo", "paystack"], required: true },
+  manualMomoSnapshot: {
+    network: { type: String, default: null },
+    number: { type: String, default: null },
+    accountName: { type: String, default: null },
+  },
   paymentReference: { type: String, required: true },
   environment: { type: String, enum: ["testing", "live"], required: true },
   status: { type: String, enum: ["pending", "submitted", "under_review", "verified", "cancelled", "rejected", "refund_pending", "disputed", "refunded"], default: "pending" },

@@ -2,6 +2,14 @@ import mongoose from "mongoose"
 const schema = new mongoose.Schema({
   _id: { type: String, default: "global" },
   paymentMode: { type: String, enum: ["manual", "paystack"], default: "manual", required: true },
+  manualMomo: {
+    enabled: { type: Boolean, default: false },
+    network: { type: String, enum: ["MTN", "Telecel", "AT"], default: "MTN" },
+    number: { type: String, default: "" },
+    accountName: { type: String, default: "" },
+    updatedAt: { type: Date, default: null },
+    updatedBy: { type: String, default: null },
+  },
   changedBy: { type: String, default: null },
   changedAt: { type: Date, default: Date.now },
 }, { versionKey: false })
