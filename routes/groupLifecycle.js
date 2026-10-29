@@ -1,3 +1,4 @@
+import { assertRentalSettlementReady } from "../services/rentalSettlementGuard.js"
 import { checkGroup } from "../lib/reconciliationChecks.mjs"
 import express from "express"
 import jwt from "jsonwebtoken"
@@ -264,6 +265,7 @@ router.post("/:checkoutId/orders/:orderId/record-payout", requireAdminAuth, requ
     if (!group || group.status !== "verified" || group.environment !== "live" || await getEnvironmentMode() !== "live") throw error("Checkout cannot be settled.")
     const order = await Order.findOne({ _id: req.params.orderId, paymentStatus: "release_pending", fulfillmentStatus: "completed", environment: "live" }).session(session)
     if (!order || !group.orderIds.some(id => String(id) === String(order.id))) throw error("Seller order is not ready for payout.")
+    await assertRentalSettlementReady(order, session)
     const verified = await Payment.findOne({ order: order.id, status: "verified", method: "manual_momo" }).session(session)
     if (!verified) throw error("Verified incoming payment record missing.")
     // A rider's reserved allocation is never included in a seller payout.
@@ -343,6 +345,7 @@ router.post("/admin/rider-funding/:orderId/record-rider-payout", requireAdminAut
     const order=await Order.findOne({_id:choice.order,paymentStatus:"release_pending",fulfillmentStatus:"completed",environment:"live"}).session(session)
     const group=await CheckoutGroup.findById(choice.checkoutId).session(session)
     if(!order || !group || group.status!=="verified" || await getEnvironmentMode()!=="live") throw error("Order not eligible for rider settlement.")
+    await assertRentalSettlementReady(order, session)
     if(money(req.body.confirmedAmount)!==money(choice.quotedFee)) throw error("Rider payout must equal the reserved fee.")
     choice.status="rider_paid";choice.riderPaidAt=new Date();choice.riderPayoutReference=req.body.externalReference.trim().toUpperCase();await choice.save({session})
     await GroupAuditEvent.create([{checkoutId:choice.checkoutId,action:"rider_payout_recorded",actorType:"admin",actorId:String(req.adminUser._id),details:{orderId:String(order._id),amount:choice.quotedFee,externalReference:choice.riderPayoutReference}}],{session})

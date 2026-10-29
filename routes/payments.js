@@ -1,3 +1,4 @@
+import { assertRentalReservationForOrder } from "../services/rentalReservation.js";
 
 import express from "express"
 
@@ -166,6 +167,7 @@ router.post("/manual/:orderId", protect, requireLiveMode, async (req, res) => {
     if (!order) {
       return res.status(404).json({ message: "Order not found." })
     }
+    await assertRentalReservationForOrder(order)
 
 
     if (order.environment === "testing" || order.isSimulatedPayment) {
@@ -292,6 +294,7 @@ router.post("/paystack/:orderId", protect, requireLiveMode, async (req, res) => 
     if (!order) {
       return res.status(404).json({ message: "Order not found." })
     }
+    await assertRentalReservationForOrder(order)
 
 
     if (order.environment === "testing" || order.isSimulatedPayment) {

@@ -1,3 +1,6 @@
+import mongoose from "mongoose"
+import RentalReservation from "../models/RentalReservation.js";
+import { reclaimExpiredReservation } from "../services/rentalReservation.js";
 
 import express from "express"
 import jwt from "jsonwebtoken"
@@ -138,6 +141,7 @@ router.post("/", async (req, res) => {
       deliveryMethod,
       paymentMethod,
       rentalDays,
+      reservationId,
     } = req.body
 
     const selectedPaymentMethod = paymentMethod || "manual_momo"
@@ -218,7 +222,7 @@ router.post("/", async (req, res) => {
     // A database lookup failure stops order creation rather than guessing.
     const environment = await getEnvironmentMode()
 
-    const order = await Order.create({
+    const orderData = {
       environment,
       buyer: buyerId || null,
       seller: resolvedSellerId,
@@ -242,7 +246,31 @@ router.post("/", async (req, res) => {
       fulfillmentStatus: "pending_payment",
       status: "Pending Confirmation",
       rentalDays: listing.type === "rent" ? Number(rentalDays) : null,
-    })
+    }
+    let order;
+    if (listing.type === "rent") {
+      if (!buyerId || !isMongoId(reservationId)) return res.status(400).json({message:"Sign in and reserve this rental before checkout."});
+      // All three operations are committed together. A crash cannot strand a claimed reservation.
+      const session = await mongoose.startSession();
+      try {
+        await session.withTransaction(async () => {
+          const reservation = await RentalReservation.findOne({
+            _id: reservationId, listing: listing._id, renter: buyerId,
+            environment, state: "reserved", order: null, expiresAt: { $gt: new Date() }
+          }).session(session);
+          if (!reservation) throw Object.assign(new Error("Reservation unavailable or expired."), {status:409});
+          if (await RentalItemLock.exists({listing:listing._id}).session(session)) throw Object.assign(new Error("Item is already rented."), {status:409});
+          const created = await Order.create([orderData], {session});
+          order = created[0];
+          const updated = await RentalReservation.updateOne({
+            _id: reservation._id, state:"reserved", order:null, expiresAt:{$gt:new Date()}
+          }, {$set:{state:"payment_pending",order:order._id}}, {session});
+          if (updated.modifiedCount !== 1) throw Object.assign(new Error("Reservation already claimed."), {status:409});
+        });
+      } finally { await session.endSession(); }
+    } else {
+      order = await Order.create(orderData);
+    }
 
     pushToSeller(req, resolvedSellerId, {
       orderId: localOrderId || String(order._id),
@@ -279,8 +307,8 @@ router.post("/", async (req, res) => {
   } catch (err) {
     console.error("Create order error:", err)
 
-    return res.status(500).json({
-      message: "Unable to create order.",
+    return res.status(err.status || (err.code === 11000 ? 409 : 500)).json({
+      message: err.status ? err.message : err.code === 11000 ? "Reservation conflict; retry safely." : "Unable to create order.",
     })
   }
 })
