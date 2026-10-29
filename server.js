@@ -22,6 +22,7 @@ import paystackWebhookRoutes from "./routes/paystackWebhook.js"
 import checkoutPaystackSafety from "./routes/checkoutPaystackSafety.js"
 import authRoutes from "./routes/auth.js"
 import listingRoutes from "./routes/listings.js"
+import searchRoutes from "./routes/search.js"
 import orderRoutes from "./routes/orders.js"
 import rentalRoutes from "./routes/rentals.js"
 import checkoutGroupRoutes from "./routes/checkoutGroups.js"
@@ -119,6 +120,7 @@ app.use("/api/checkout-paystack", checkoutPaystackRoutes)
 app.use("/api/auth", authSafetyRoutes)
 app.use("/api/auth", authRoutes)
 app.use("/api/listings", listingRoutes)
+app.use("/api/search", searchRoutes)
 app.use("/api/orders/checkout", checkoutGroupRoutes)
 app.use("/api/checkout-payments", checkoutPaystackSafety)
 app.use("/api/checkout-payments", checkoutPaymentRoutes)
