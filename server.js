@@ -23,6 +23,7 @@ import checkoutPaystackSafety from "./routes/checkoutPaystackSafety.js"
 import authRoutes from "./routes/auth.js"
 import listingRoutes from "./routes/listings.js"
 import orderRoutes from "./routes/orders.js"
+import rentalRoutes from "./routes/rentals.js"
 import checkoutGroupRoutes from "./routes/checkoutGroups.js"
 import checkoutPaymentRoutes from "./routes/checkoutPayments.js"
 import groupLifecycleRoutes from "./routes/groupLifecycle.js"
@@ -134,6 +135,7 @@ app.use("/api/orders", async (req, res, next) => {
   } catch (err) { console.error("Group cancellation guard failed", err); res.status(503).json({ message: "Cancellation safety check unavailable." }) }
 })
 app.use("/api/orders", orderRoutes)
+app.use("/api/rentals", rentalRoutes)
 app.use("/api/payments", async (req, res, next) => {
   const match = req.path.match(/^\/(?:manual|paystack)\/([0-9a-f]{24})(?:\/verify)?$/i)
   if (!match || !["POST", "PUT", "PATCH"].includes(req.method)) return next()
