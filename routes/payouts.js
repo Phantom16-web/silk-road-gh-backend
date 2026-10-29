@@ -1,3 +1,4 @@
+import { assertServiceSettlementReady } from '../services/serviceSettlementGuard.js'
 import { assertRentalSettlementReady } from "../services/rentalSettlementGuard.js"
 import express from 'express'
 import crypto from 'node:crypto'
@@ -34,6 +35,7 @@ router.post('/orders/:orderId/approve',requireReAuth,handler(async(req,res)=>{
   const order=await Order.findById(req.params.orderId).session(session)
   if(!order||order.paymentStatus!=='release_pending'||order.fulfillmentStatus!=='completed'||order.cancelled)throw error('Order not eligible for settlement')
   await assertRentalSettlementReady(order, session)
+  await assertServiceSettlementReady(order, session)
   const group=await CheckoutGroup.findOne({orderIds:order._id,status:'verified',paymentMethod:'paystack'}).session(session)
   if(!group||group.environment!==order.environment)throw error('Verified Paystack checkout required')
   const environment=order.environment==='testing'?'test':'live'
@@ -76,6 +78,7 @@ router.post('/intents/:id/submit',requireReAuth,handler(async(req,res)=>{
  const group=await CheckoutGroup.findById(intent.checkoutId)
  if(!order||!group||group.status!=='verified'||order.paymentStatus!=='release_pending'||order.fulfillmentStatus!=='completed'||order.cancelled||order.environment!==(intent.environment==='test'?'testing':'live'))throw error('Financial state changed. Do not transfer.')
  await assertRentalSettlementReady(order)
+ await assertServiceSettlementReady(order)
  const other=await PayoutIntent.find({order:order._id,state:{$in:['failed','reversed','cancelled']}})
  if(other.length)throw error('Other payout entitlement needs reconciliation')
  const output=await submitApprovedPayout(intent.id)

@@ -172,6 +172,12 @@ router.post("/", async (req, res) => {
       })
     }
 
+    // Services must be booked and accepted before any order can exist.
+    // The authenticated service-request route creates these orders instead.
+    if (listing.type === "service") {
+      return res.status(409).json({message:"Use an accepted service request to begin checkout."})
+    }
+
     const resolvedSellerId = String(listing.seller)
 
     if (
