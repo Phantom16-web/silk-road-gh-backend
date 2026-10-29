@@ -1,3 +1,4 @@
+import serviceRequestRoutes from "./routes/serviceRequests.js"
 import authSafetyRoutes from "./routes/authSafety.js"
 import adminLegacySafety from "./routes/adminLegacySafety.js"
 import adminPermissionStudioRoutes from "./routes/adminPermissionStudio.js"
@@ -121,6 +122,7 @@ app.use("/api/auth", authSafetyRoutes)
 app.use("/api/auth", authRoutes)
 app.use("/api/listings", listingRoutes)
 app.use("/api/search", searchRoutes)
+app.use("/api/service-requests", serviceRequestRoutes)
 app.use("/api/orders/checkout", checkoutGroupRoutes)
 app.use("/api/checkout-payments", checkoutPaystackSafety)
 app.use("/api/checkout-payments", checkoutPaymentRoutes)
