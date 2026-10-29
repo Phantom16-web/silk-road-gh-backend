@@ -30,4 +30,10 @@ const listingSchema = new mongoose.Schema({
   reviews: { type: Number, default: 0 },
 }, { timestamps: true })
 
+// Search Phase 3: indexes supporting public catalogue filters and stable pagination.
+listingSchema.index({ status: 1, type: 1, createdAt: -1 });
+listingSchema.index({ status: 1, type: 1, category: 1, createdAt: -1 });
+listingSchema.index({ status: 1, type: 1, price: 1 });
+listingSchema.index({ status: 1, type: 1, dailyRate: 1 });
+
 export default mongoose.model("Listing", listingSchema)
