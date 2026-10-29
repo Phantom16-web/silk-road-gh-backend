@@ -1,4 +1,5 @@
 import mongoose from 'mongoose'
+import { assertServiceSettlementReady } from './serviceSettlementGuard.js'
 import PayoutIntent from '../models/PayoutIntent.js'
 import Order from '../models/Order.js'
 import CheckoutGroup from '../models/CheckoutGroup.js'
@@ -14,6 +15,7 @@ export async function finalizeVerifiedPayouts(orderId) {
     await session.withTransaction(async () => {
       const order = await Order.findById(orderId).session(session)
       if (!order) throw new Error('Order not found')
+      await assertServiceSettlementReady(order,session)
       const intents = await PayoutIntent.find({ order: order._id, provider: 'paystack' }).session(session)
       if (!intents.length || !intents.some(i => i.role === 'seller')) throw new Error('No approved seller payout')
       if (intents.some(i => i.state !== 'succeeded')) { result = { finalized: false, reason: 'One or more payouts are not confirmed successful' }; return }
