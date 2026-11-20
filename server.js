@@ -24,6 +24,7 @@ import checkoutPaystackSafety from "./routes/checkoutPaystackSafety.js"
 import authRoutes from "./routes/auth.js"
 import listingRoutes from "./routes/listings.js"
 import searchRoutes from "./routes/search.js"
+import { initSearch, analyticsRouter as searchAnalyticsRoutes } from "./services/searchIndex.js"
 import orderRoutes from "./routes/orders.js"
 import rentalRoutes from "./routes/rentals.js"
 import checkoutGroupRoutes from "./routes/checkoutGroups.js"
@@ -43,8 +44,15 @@ import testingPaymentRoutes from "./routes/testingPayments.js"
 
 dotenv.config()
 const app = express()
+// Render (and any host) puts a reverse proxy in front of this server. Without this, every visitor
+// shares the proxy's IP and the rate limiters below would throttle the WHOLE site as one user.
+// Open /api/diagnostics/ip to verify; set TRUST_PROXY on Render if the hop count differs.
+const trustProxyEnv = process.env.TRUST_PROXY
+app.set("trust proxy", trustProxyEnv === undefined || trustProxyEnv === "" ? 1 : /^\d+$/.test(trustProxyEnv) ? Number(trustProxyEnv) : trustProxyEnv === "false" ? false : trustProxyEnv)
 const httpServer = createServer(app)
-const allowedOrigins = ["http://localhost:5173", "https://silk-road-gh.vercel.app", /\.vercel\.app$/]
+// Exact origins only. To add a domain (Cloudflare Pages, custom domain) set FRONTEND_ORIGINS on the
+// server to a comma-separated list, e.g. https://silk-road-gh.pages.dev,https://silkroadgh.com
+const allowedOrigins = [...new Set(["http://localhost:5173", "https://silk-road-gh.vercel.app", ...(process.env.FRONTEND_ORIGINS || "").split(",").map(origin => origin.trim().replace(/\/+$/, "")).filter(Boolean)])]
 const io = new Server(httpServer, { cors: { origin: allowedOrigins, methods: ["GET", "POST"], credentials: true }, pingTimeout: 60000, pingInterval: 25000 })
 const sellerSockets = new Map()
 function registerSeller(socket, sellerId) {
@@ -109,8 +117,11 @@ app.use(mongoSanitize())
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: { message: "Too many requests. Please try again later." } })
 app.use("/api/auth", authLimiter)
 app.use("/api/rider-auth", authLimiter)
-const generalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 500, message: { message: "Too many requests. Please try again later." } })
+const generalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 500, message: { message: "Too many requests. Please try again later." }, skip: req => req.path === "/search" || req.path.startsWith("/search/") })
 app.use("/api", generalLimiter)
+// Search fires on every pause while typing, and a whole campus can share one Wi-Fi IP, so it gets its own roomier limit.
+const searchLimiter = rateLimit({ windowMs: 60 * 1000, max: 240, message: { message: "Too many searches. Please slow down for a moment." } })
+app.use("/api/search", searchLimiter)
 app.use("/api/admin-moderation", adminModerationRoutes)
 app.use("/api/admin-permissions", adminPermissionStudioRoutes)
 app.use("/api/owner/payouts", payoutRoutes)
@@ -122,6 +133,7 @@ app.use("/api/auth", authSafetyRoutes)
 app.use("/api/auth", authRoutes)
 app.use("/api/listings", listingRoutes)
 app.use("/api/search", searchRoutes)
+app.use("/api/search-analytics", searchAnalyticsRoutes)
 app.use("/api/service-requests", serviceRequestRoutes)
 app.use("/api/orders/checkout", checkoutGroupRoutes)
 app.use("/api/checkout-payments", checkoutPaystackSafety)
@@ -188,6 +200,8 @@ app.use("/api/promos", promoRoutes)
 app.use("/api/rider-auth", riderAuthRoutes)
 app.use("/api/deliveries", deliveryRoutes)
 app.get("/", (req, res) => res.json({ status: "ok", service: "Silk Road GH API", ts: Date.now() }))
+// Shows how the server sees YOUR request, to confirm the proxy setting is right (ip should be your own public IP).
+app.get("/api/diagnostics/ip", (req, res) => res.json({ ip: req.ip, forwardedFor: req.headers["x-forwarded-for"] || null, trustProxy: app.get("trust proxy") }))
 app.use((req, res) => res.status(404).json({ message: "Route not found" }))
 const PORT = process.env.PORT || 5000
 mongoose.connect(process.env.MONGODB_URI).then(() => {
@@ -195,5 +209,6 @@ mongoose.connect(process.env.MONGODB_URI).then(() => {
   startPaystackInboxWorker()
   startPaystackTransferInboxWorker()
   startCommissionNoticeWorker()
+  initSearch(app)
   httpServer.listen(PORT, () => console.log(`🚀 Silk Road GH running on port ${PORT} — Socket.io active`))
 }).catch(err => { console.error("❌ MongoDB error:", err.message); process.exit(1) })
