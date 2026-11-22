@@ -12,6 +12,9 @@ const riderSchema = new mongoose.Schema({
   isOnline: { type: Boolean, default: false },
   isApproved: { type: Boolean, default: false },
   isActive: { type: Boolean, default: true },
+  // Test riders only ever see and accept Testing Mode orders; real riders only see live orders.
+  // Set by an admin (PUT /api/riders/:id/status).
+  isTestRider: { type: Boolean, default: false },
   // An approved photo is immutable to riders. Admins must review replacements.
   photoUrl: { type: String, default: null },
   photoPublicId: { type: String, default: null },
