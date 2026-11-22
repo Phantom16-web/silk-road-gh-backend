@@ -5,6 +5,7 @@ import express from "express"
 import Order from "../models/Order.js"
 import { requireLiveMode } from "../middleware/environment.js"
 import Payment from "../models/Payment.js"
+import { getPaystackReceiptEmail } from "../models/PaymentSettings.js"
 import User from "../models/User.js"
 
 import protect from "../middleware/auth.js"
@@ -218,6 +219,15 @@ router.post("/manual/:orderId", protect, requireLiveMode, async (req, res) => {
       })
     }
 
+    const receiptEmail = await getPaystackReceiptEmail()
+    if (!receiptEmail) {
+      return res.status(503).json({
+        message: "Card and Mobile Money payments are not fully set up yet. Please use manual Mobile Money.",
+        code: "PAYSTACK_EMAIL_NOT_CONFIGURED",
+        fallback: "manual_momo",
+      })
+    }
+
     const claimedOrder = await Order.findOneAndUpdate(
       {
         _id: order._id,
@@ -379,7 +389,7 @@ router.post("/paystack/:orderId", protect, requireLiveMode, async (req, res) => 
       order: claimedOrder,
       amount: claimedOrder.amount,
       currency: CURRENCY,
-      email: buyer.email,
+      email: receiptEmail,
     })
 
     const payment = await Payment.create({
