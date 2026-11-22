@@ -34,6 +34,16 @@ const claim = (req, group) => {
     typeof group.claimTokenHash === "string" &&
     crypto.timingSafeEqual(Buffer.from(digest(token), "hex"), Buffer.from(group.claimTokenHash, "hex"))
 }
+// Delivery codes work in BOTH modes. A checkout is only ever confirmed in the mode it was created in,
+// and Testing Mode orders must carry a simulated payment (live orders must not).
+async function deliveryModeFor(group) {
+  const mode = await getEnvironmentMode()
+  return group && group.environment === mode && ["testing", "live"].includes(mode) ? mode : null
+}
+const orderModeFilter = mode => mode === "testing"
+  ? { environment: "testing", isSimulatedPayment: true }
+  : { environment: "live", isSimulatedPayment: { $ne: true } }
+
 async function runTransaction(res, callback) {
   const session = await mongoose.startSession()
   try {
@@ -175,8 +185,9 @@ router.post("/:checkoutId/orders/:orderId/delivery-code", async (req, res) => {
   return runTransaction(res, async session => {
     const group = await CheckoutGroup.findById(req.params.checkoutId).select("+claimTokenHash").session(session)
     if (!group || !claim(req, group)) throw error("Not authorized.", 403)
-    if (group.status !== "verified" || group.environment !== "live" || await getEnvironmentMode() !== "live") throw error("Delivery confirmation unavailable for this checkout.")
-    const order = await Order.findOne({ _id: req.params.orderId, paymentStatus: "escrow_held", fulfillmentStatus: { $in: ["awaiting_delivery", "delivery_in_progress", "delivered_pending_otp"] }, environment: "live" }).session(session)
+    const mode = await deliveryModeFor(group)
+    if (group.status !== "verified" || !mode) throw error("Delivery confirmation unavailable for this checkout.")
+    const order = await Order.findOne({ _id: req.params.orderId, paymentStatus: "escrow_held", fulfillmentStatus: { $in: ["awaiting_delivery", "delivery_in_progress", "delivered_pending_otp"] }, ...orderModeFilter(mode) }).session(session)
     if (!order || !group.orderIds.some(id => String(id) === String(order._id))) throw error("Order is not eligible for delivery confirmation.")
     const otp = String(crypto.randomInt(100000, 1000000))
     const otpHash = digest(`${group.id}:${order.id}:${otp}`)
@@ -190,8 +201,9 @@ router.post("/:checkoutId/orders/:orderId/confirm-delivery", protect, async (req
   if (!isId(req.params.orderId) || !/^\d{6}$/.test(String(req.body?.deliveryCode || ""))) return res.status(400).json({ message: "Valid order ID and six-digit delivery code required." })
   return runTransaction(res, async session => {
     const group = await CheckoutGroup.findById(req.params.checkoutId).session(session)
-    if (!group || group.status !== "verified" || group.environment !== "live" || await getEnvironmentMode() !== "live") throw error("Checkout is not eligible.")
-    const order = await Order.findOne({ _id: req.params.orderId, seller: req.user.id, paymentStatus: "escrow_held", environment: "live", fulfillmentStatus: { $in: ["awaiting_delivery", "delivery_in_progress", "delivered_pending_otp"] } }).session(session)
+    const mode = group ? await deliveryModeFor(group) : null
+    if (!group || group.status !== "verified" || !mode) throw error("Checkout is not eligible.")
+    const order = await Order.findOne({ _id: req.params.orderId, seller: req.user.id, paymentStatus: "escrow_held", ...orderModeFilter(mode), fulfillmentStatus: { $in: ["awaiting_delivery", "delivery_in_progress", "delivered_pending_otp"] } }).session(session)
     if (!order || !group.orderIds.some(id => String(id) === String(order.id))) throw error("Seller is not authorized for this order.", 403)
     if (await RiderFundingChoice.exists({order:order._id,status:"dispatched"}).session(session)) throw error("This order has an assigned rider. Use rider delivery confirmation instead.",403)
     const record = await GroupFulfillment.findOne({ order: order._id }).select("+otpHash").session(session)
@@ -234,8 +246,9 @@ router.post("/:checkoutId/orders/:orderId/confirm-rider-delivery", async (req,re
   if (!isId(riderId) || !await Rider.exists({_id:riderId,isActive:true,isApproved:true})) return res.status(403).json({message:"Approved rider required."})
   return runTransaction(res,async session=>{
     const group=await CheckoutGroup.findById(req.params.checkoutId).session(session)
-    if (!group || group.status!=="verified" || group.environment!=="live" || await getEnvironmentMode()!=="live") throw error("Checkout is not eligible.")
-    const order=await Order.findOne({_id:req.params.orderId,paymentStatus:"escrow_held",fulfillmentStatus:"delivered_pending_otp",environment:"live"}).session(session)
+    const mode = group ? await deliveryModeFor(group) : null
+    if (!group || group.status!=="verified" || !mode) throw error("Checkout is not eligible.")
+    const order=await Order.findOne({_id:req.params.orderId,paymentStatus:"escrow_held",fulfillmentStatus:"delivered_pending_otp",...orderModeFilter(mode)}).session(session)
     if (!order || !group.orderIds.some(id=>String(id)===String(order.id))) throw error("Order is not eligible.")
     const funding=await RiderFundingChoice.findOne({order:order._id,checkoutId:group.id,status:"dispatched"}).session(session)
     if (!funding?.deliveryId) throw error("No funded rider dispatch for this order.")
