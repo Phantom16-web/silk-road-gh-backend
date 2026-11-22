@@ -2,6 +2,7 @@ import express from 'express'
 import jwt from 'jsonwebtoken'
 import Rider from '../models/Rider.js'
 import upload from '../middleware/upload.js'
+import { syncRiderOnlineRoom } from '../services/notify.js'
 
 const router = express.Router()
 const generateToken = id => jwt.sign({ id, role: 'rider' }, process.env.JWT_SECRET, { expiresIn: '30d' })
@@ -15,7 +16,7 @@ function getRiderId(req) {
 }
 function safe(r) {
   return { _id:r._id, name:r.name, phone:r.phone, email:r.email, university:r.university,
-    vehicle:r.vehicle, isOnline:r.isOnline, isActive:r.isActive, isApproved:r.isApproved,
+    vehicle:r.vehicle, isTestRider:!!r.isTestRider, isOnline:r.isOnline, isActive:r.isActive, isApproved:r.isApproved,
     photoReviewStatus:r.photoReviewStatus, photoUrl:r.photoReviewStatus==='approved'?r.photoUrl:null,
     totalEarned:r.totalEarned, totalDeliveries:r.totalDeliveries, rating:r.rating }
 }
@@ -59,7 +60,7 @@ router.put('/toggle-online',async(req,res)=>{
   try {const id=getRiderId(req);if(!id)return res.status(401).json({message:'Not authorized.'})
     const rider=await Rider.findById(id);if(!rider||!rider.isActive)return res.status(403).json({message:'Rider unavailable.'})
     if(!rider.isApproved||rider.photoReviewStatus!=='approved')return res.status(403).json({message:'Admin identity and photo approval required before going online.'})
-    rider.isOnline=!rider.isOnline;await rider.save();return res.json({isOnline:rider.isOnline})
+    rider.isOnline=!rider.isOnline;await rider.save();syncRiderOnlineRoom(req.app,rider._id,rider.isOnline,rider.isTestRider);return res.json({isOnline:rider.isOnline})
   }catch{return res.status(500).json({message:'Unable to change availability.'})}
 })
 router.put('/location',async(req,res)=>{
@@ -72,7 +73,7 @@ router.delete('/delete-account',async(req,res)=>{
   try {const id=getRiderId(req);if(!id)return res.status(401).json({message:'Not authorized.'})
     const rider=await Rider.findById(id);if(!rider)return res.status(404).json({message:'Rider not found.'})
     if(rider.activeDelivery)return res.status(409).json({message:'Complete or resolve the active delivery before account closure.'})
-    rider.isActive=false;rider.isOnline=false;await rider.save();return res.json({message:'Rider account deactivated. Contact support for data deletion.'})
+    rider.isActive=false;rider.isOnline=false;await rider.save();syncRiderOnlineRoom(req.app,rider._id,false);return res.json({message:'Rider account deactivated. Contact support for data deletion.'})
   }catch{return res.status(500).json({message:'Unable to deactivate account.'})}
 })
 export default router
