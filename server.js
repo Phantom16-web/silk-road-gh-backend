@@ -39,6 +39,8 @@ import { startCommissionNoticeWorker } from "./services/commissionNoticeWorker.j
 import promoRoutes from "./routes/promos.js"
 import riderAuthRoutes from "./routes/riderAuth.js"
 import deliveryRoutes from "./routes/deliveries.js"
+import { userNotificationRoutes, riderNotificationRoutes } from "./routes/notifications.js"
+import { riderRoom, ONLINE_RIDERS_ROOM, ONLINE_TEST_RIDERS_ROOM } from "./services/notify.js"
 import environmentRoutes from "./routes/environment.js"
 import testingPaymentRoutes from "./routes/testingPayments.js"
 
@@ -69,6 +71,15 @@ io.use(async (socket, next) => {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET)
     if (!decoded?.id || !mongoose.isValidObjectId(decoded.id)) return next(new Error("Invalid socket token"))
+    if (decoded.role === "rider") {
+      const rider = await (await import("./models/Rider.js")).default.findById(decoded.id).select("_id isActive isApproved isOnline isTestRider photoReviewStatus").lean()
+      if (!rider || !rider.isActive) return next(new Error("Account unavailable"))
+      socket.data.userId = null
+      socket.data.riderId = String(rider._id)
+      socket.data.riderOnline = !!(rider.isOnline && rider.isApproved && rider.photoReviewStatus === "approved")
+      socket.data.riderTest = !!rider.isTestRider
+      return next()
+    }
     const user = await (await import("./models/User.js")).default.findById(decoded.id).select("_id status")
     if (!user || user.status !== "Active") return next(new Error("Account unavailable"))
     socket.data.userId = String(decoded.id)
@@ -79,9 +90,23 @@ io.on("connection", socket => {
   // Keep an authenticated socket in a per-account room so moderation can
   // revoke existing connections, not just block future handshakes.
   if (socket.data.userId) socket.join(`user:${socket.data.userId}`)
+  // Riders get their own room, plus the online-riders room that new delivery jobs are sent to.
+  if (socket.data.riderId) {
+    socket.join(riderRoom(socket.data.riderId))
+    if (socket.data.riderOnline) socket.join(socket.data.riderTest ? ONLINE_TEST_RIDERS_ROOM : ONLINE_RIDERS_ROOM)
+  }
   // Every incoming authenticated event rechecks current account status.
   // Fail closed if the database is unavailable. No unverified event is handled.
   socket.use(async (_packet, next) => {
+    if (socket.data.riderId) {
+      try {
+        const rider = await (await import("./models/Rider.js")).default.findById(socket.data.riderId).select("isActive").lean()
+        if (rider?.isActive) return next()
+      } catch {}
+      socket.emit("account_access_revoked", { message: "Account access revoked." })
+      socket.disconnect(true)
+      return next(new Error("Account access revoked"))
+    }
     if (!socket.data.userId) return next()
     try {
       const User = (await import("./models/User.js")).default
@@ -98,7 +123,12 @@ io.on("connection", socket => {
     }
   })
   socket.on("register_seller", id => registerSeller(socket, id))
-  socket.on("register_rider", id => socket.emit("rider_registered", { riderId: String(id), socketId: socket.id }))
+  // Riders are identified by their token, not by an id they send. A mismatch is rejected.
+  socket.on("register_rider", id => {
+    if (!socket.data.riderId || String(id) !== socket.data.riderId)
+      return socket.emit("rider_registration_error", { message: "Rider login required for live updates" })
+    socket.emit("rider_registered", { riderId: socket.data.riderId, socketId: socket.id })
+  })
   socket.on("disconnect", () => {
     const id = socket.data.sellerId
     if (id && sellerSockets.has(id)) {
@@ -139,6 +169,8 @@ app.use("/api/orders/checkout", checkoutGroupRoutes)
 app.use("/api/checkout-payments", checkoutPaystackSafety)
 app.use("/api/checkout-payments", checkoutPaymentRoutes)
 app.use("/api/seller-notifications", sellerNotificationRoutes)
+app.use("/api/notifications", userNotificationRoutes)
+app.use("/api/rider-notifications", riderNotificationRoutes)
 app.use("/api/group-lifecycle", groupLifecycleRoutes)
 app.use("/api/orders", async (req, res, next) => {
   const match = req.path.match(/^\/([0-9a-f]{24})\/cancel$/i)
