@@ -5,6 +5,7 @@ import User from "../models/User.js"
 import Listing from "../models/Listing.js"
 import Order from "../models/Order.js"
 import Rider from "../models/Rider.js"
+import { syncRiderOnlineRoom } from "../services/notify.js"
 import Delivery from "../models/Delivery.js"
 import Admin from "../models/Admin.js"
 import Payment from "../models/Payment.js"
@@ -1695,6 +1696,35 @@ router.put(
         message:
           err.message,
       })
+    }
+  }
+)
+
+// Mark a rider as a TEST rider (sees and accepts Testing Mode jobs only) or back to a real rider.
+router.put(
+  "/riders/:id/test-mode",
+  requirePermission("manage_riders"),
+  async (req, res) => {
+    try {
+      if (typeof req.body?.isTestRider !== "boolean") {
+        return res.status(400).json({ message: "isTestRider must be true or false." })
+      }
+      const rider = await Rider.findById(req.params.id)
+      if (!rider) return res.status(404).json({ message: "Rider not found." })
+      if (rider.activeDelivery) {
+        return res.status(409).json({ message: "This rider has an active delivery. Finish or cancel it first." })
+      }
+      rider.isTestRider = req.body.isTestRider
+      rider.isOnline = false
+      await rider.save()
+      syncRiderOnlineRoom(req.app, rider._id, false, rider.isTestRider)
+      await logAction(req, "rider_test_mode_changed", "rider", rider._id.toString(), {
+        name: rider.name,
+        isTestRider: rider.isTestRider,
+      })
+      res.json({ message: `${rider.name} is now a ${rider.isTestRider ? "test" : "real"} rider.`, isTestRider: rider.isTestRider })
+    } catch (err) {
+      res.status(500).json({ message: err.message })
     }
   }
 )
