@@ -6,6 +6,7 @@ import Delivery from "../models/Delivery.js"
 import Rider from "../models/Rider.js"
 import Order from "../models/Order.js"
 import { getEnvironmentMode } from "../models/Environment.js"
+import { notify, notifyOnlineRiders } from "../services/notify.js"
 
 import {
   haversineKm,
@@ -45,82 +46,46 @@ function getAnyUserId(req) {
   }
 }
 
-function pushTo(
-  req,
-  userId,
-  event,
-  data
-) {
-  try {
-    const io =
-      req.app.get("io")
+// Delivery event -> stored notification. OTPs are emitted live only, never stored.
+const DELIVERY_NOTIFY = {
+  delivery_accepted: { title: "Rider accepted" },
+  delivery_picked_up: { title: "Package picked up" },
+  delivery_at_door: { title: "Package at the door", dedupe: true },
+  delivery_otp_ready: { title: "Your delivery code is ready", dedupe: true,
+    message: "Your delivery code is ready. Only give it to the rider once you have your item.",
+    aliases: ["delivery_otp"] },
+  delivery_completed: { title: "Delivery confirmed", dedupe: true },
+  delivery_cancelled_by_rider: { title: "Rider cancelled" },
+  sale_completed: { title: "Sale complete", dedupe: true },
+}
 
-    const sockets =
-      req.app.get(
-        "sellerSockets"
-      )
+function pushTo(req, userId, event, data) {
+  const meta = DELIVERY_NOTIFY[event] || { title: event }
+  const { otp, ...safe } = data || {}
+  // Fire and forget: notify() never throws, so a failure cannot break the request.
+  notify(req.app, {
+    recipient: userId,
+    recipientModel: "User",
+    type: event,
+    title: meta.title,
+    message: safe.message || meta.message || meta.title,
+    deliveryId: safe.deliveryId,
+    data: safe,
+    live: otp ? { otp } : {},
+    aliases: meta.aliases || [],
+    dedupeKey: meta.dedupe && safe.deliveryId ? `${event}:${safe.deliveryId}` : null,
+  })
+}
 
-    const queueNotif =
-      req.app.get(
-        "queueNotification"
-      )
-
-    if (
-      !io ||
-      !sockets ||
-      !userId
-    ) {
-      return
-    }
-
-    const userSockets =
-      sockets.get(
-        String(userId)
-      )
-
-    if (
-      !userSockets ||
-      userSockets.size === 0
-    ) {
-      const queueable = [
-        "delivery_accepted",
-        "delivery_picked_up",
-        "delivery_at_door",
-        "delivery_completed",
-        "delivery_cancelled_by_rider",
-        "sale_completed",
-      ]
-
-      if (
-        queueNotif &&
-        queueable.includes(
-          event
-        )
-      ) {
-        queueNotif(
-          String(userId),
-          event,
-          data
-        )
-      }
-
-      return
-    }
-
-    userSockets.forEach(
-      (socketId) => {
-        io.to(socketId).emit(
-          event,
-          data
-        )
-      }
-    )
-  } catch (err) {
-    console.error(
-      "pushTo error:",
-      err.message
-    )
-  }
+// Same, for the buyer on a delivery (skipped when the delivery has no buyer).
+function pushToBuyer(req, delivery, event, message) {
+  if (!delivery?.buyer) return
+  pushTo(req, String(delivery.buyer), event, {
+    deliveryId: delivery._id.toString(),
+    localOrderId: delivery.localOrderId,
+    itemTitle: delivery.itemTitle,
+    message,
+  })
 }
 
 function isMongoId(value) {
@@ -396,7 +361,10 @@ router.get(
         // the rider has accepted and been assigned the delivery.
         jobs: (await Promise.all(jobs.map(async (job) => {
           const linkedOrder = await findOrderForDelivery(job)
-          return (linkedOrder?.environment !== "testing" && await isPaymentClearedForDelivery(linkedOrder)) ? buildDeliveryJobPayload(job) : null
+          // Test riders see only Testing Mode jobs. Real riders see only live jobs.
+          const jobIsTest = linkedOrder?.environment === "testing"
+          if (!linkedOrder || jobIsTest !== !!rider.isTestRider) return null
+          return (await isPaymentClearedForDelivery(linkedOrder)) ? buildDeliveryJobPayload(job) : null
         }))).filter(Boolean),
         activeDelivery: null,
       })
@@ -1039,17 +1007,7 @@ router.post(
 
       await order.save()
 
-      const io =
-        req.app.get("io")
-
-      if (io) {
-        io.emit(
-          "new_delivery_job",
-          buildDeliveryJobPayload(
-            delivery
-          )
-        )
-      }
+      notifyOnlineRiders(req.app, buildDeliveryJobPayload(delivery), { testing: order.environment === "testing" })
 
       return res.status(201).json({
         delivery,
@@ -1169,9 +1127,12 @@ router.put(
         })
       }
 
-      // Never assign a real rider account to a simulated order.
-      if (order.environment === "testing") {
-        return res.status(403).json({ code: "TEST_RIDER_ASSIGNMENT_BLOCKED", message: "Testing orders cannot be assigned to real rider accounts." })
+      // Test and live never mix: testing orders need a test rider, live orders need a real rider.
+      if (order.environment === "testing" && !rider.isTestRider) {
+        return res.status(403).json({ code: "TEST_RIDER_REQUIRED", message: "This is a Testing Mode order. Only test rider accounts can accept it." })
+      }
+      if (order.environment !== "testing" && rider.isTestRider) {
+        return res.status(403).json({ code: "LIVE_ORDER_TEST_RIDER_BLOCKED", message: "Test rider accounts cannot accept live orders." })
       }
       if (!rider.photoUrl || rider.photoReviewStatus !== "approved") {
         return res.status(403).json({ message: "An admin-approved rider photograph is required before accepting jobs." })
@@ -1222,6 +1183,8 @@ router.put(
             `${rider.name} accepted and is heading to pick up.`,
         }
       )
+
+      pushToBuyer(req, delivery, "delivery_accepted", `${rider.name} accepted your delivery and is heading to the seller.`)
 
       return res.json({
         delivery,
@@ -1395,17 +1358,8 @@ router.put(
         }
       )
 
-      const io =
-        req.app.get("io")
-
-      if (io) {
-        io.emit(
-          "new_delivery_job",
-          buildDeliveryJobPayload(
-            delivery
-          )
-        )
-      }
+      const relistedOrder = await findOrderForDelivery(delivery)
+      notifyOnlineRiders(req.app, buildDeliveryJobPayload(delivery), { testing: relistedOrder?.environment === "testing" })
 
       return res.json({
         message:
@@ -1538,6 +1492,8 @@ router.put(
             "Package picked up, heading to buyer.",
         }
       )
+
+      pushToBuyer(req, delivery, "delivery_picked_up", "Your package has been picked up and is on the way.")
 
       return res.json({
         delivery,
@@ -2173,6 +2129,19 @@ router.put(
             "Delivery confirmed via OTP.",
         }
       )
+
+      if (delivery.rider) {
+        notify(req.app, {
+          recipient: String(delivery.rider),
+          recipientModel: "Rider",
+          type: "delivery_completed",
+          title: "Delivery confirmed",
+          message: "The buyer confirmed delivery. Thank you!",
+          deliveryId: delivery._id,
+          data: { deliveryId: delivery._id.toString(), itemTitle: delivery.itemTitle, deliveryFee: delivery.deliveryFee },
+          dedupeKey: `delivery_completed:${delivery._id}`,
+        })
+      }
 
       // ─────────────────────────────────────────────────────────────────────
       // BUYER NOTIFICATION
