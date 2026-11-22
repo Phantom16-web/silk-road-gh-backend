@@ -1,5 +1,5 @@
 import express from 'express'
-import PaymentSettings, { getPaymentMode } from '../models/PaymentSettings.js'
+import PaymentSettings, { getPaymentMode, getPaystackReceiptEmail, isValidReceiptEmail } from '../models/PaymentSettings.js'
 import { requireAdminAuth, requireOwner, requireReAuth, logAction } from '../middleware/adminAuth.js'
 const router=express.Router()
 const paystackReady=()=>Boolean(process.env.PAYSTACK_SECRET_KEY?.match(/^sk_(test|live)_[A-Za-z0-9]+$/)) && process.env.ENABLE_HYBRID_PAYSTACK==='true'
@@ -11,6 +11,23 @@ router.put('/payment-mode',requireAdminAuth,requireOwner,requireReAuth,async(req
  if(!['manual','paystack'].includes(mode))return res.status(400).json({message:'Invalid payment provider.'})
  if(mode==='paystack'&&!paystackReady())return res.status(409).json({message:'Paystack is not configured or hybrid activation is disabled.'})
  try{const previous=await getPaymentMode();await PaymentSettings.findByIdAndUpdate('global',{paymentMode:mode,changedBy:req.adminUser.email,changedAt:new Date()},{upsert:true,runValidators:true});await logAction(req,'payment_provider_changed','payment_settings','global',{from:previous,to:mode});return res.json({paymentMode:mode,paystackAvailable:paystackReady()})}catch(e){console.error('Payment mode update failed',e);return res.status(500).json({message:'Unable to save payment settings.'})}
+})
+
+// The single email Paystack receives for every payment. Only the Owner can read or change it.
+const maskEmail = e => e ? e.replace(/^(.).*(@.*)$/, '$1•••$2') : null
+router.get('/paystack-email', requireAdminAuth, requireOwner, async(req,res)=>{
+  try { const email=await getPaystackReceiptEmail(); res.json({email:email||'',configured:Boolean(email)}) }
+  catch { res.status(503).json({message:'Unable to load the Paystack email.'}) }
+})
+router.put('/paystack-email', requireAdminAuth, requireOwner, requireReAuth, async(req,res)=>{
+  try {
+    const email=String(req.body?.email||'').trim().toLowerCase()
+    if(!isValidReceiptEmail(email)) return res.status(400).json({message:'Enter a valid email address.'})
+    const before=await getPaystackReceiptEmail()
+    await PaymentSettings.findByIdAndUpdate('global',{$set:{paystackReceiptEmail:email,changedBy:req.adminUser.email,changedAt:new Date()}},{upsert:true,runValidators:true})
+    await logAction(req,'paystack_receipt_email_changed','payment_settings','global',{previous:maskEmail(before),next:maskEmail(email)})
+    res.json({email,configured:true})
+  } catch(e){ console.error('Paystack email update',e); res.status(500).json({message:'Unable to save the Paystack email.'}) }
 })
 
 const publicMomo = (m) => ({
