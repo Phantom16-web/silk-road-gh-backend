@@ -7,6 +7,7 @@ import Order from "../models/Order.js"
 import RiderFundingChoice from "../models/RiderFundingChoice.js"
 import { getEnvironmentMode } from "../models/Environment.js"
 import { haversineKm, calculateDeliveryFee } from "../utils/distance.js"
+import { notifyOnlineRiders } from "../services/notify.js"
 
 const router = express.Router()
 const money = value => Math.round(Number(value) * 100) / 100
@@ -80,7 +81,7 @@ router.post("/:orderId/dispatch", protect, async (req, res) => {
     let result
     await session.withTransaction(async () => {
       const { order, group, mode } = await eligibleOrder(req.params.orderId, req.user.id, session)
-      if (mode === "testing") throw conflict("Simulated orders cannot dispatch real riders; no real rider payout may be created.")
+      // Testing Mode jobs are only visible to, and acceptable by, test rider accounts (see routes/deliveries.js).
       const funding = await RiderFundingChoice.findOne({ order: order._id, seller: order.seller,
         checkoutId: group.id, fundingSource: "earnings", status: "reserved", deliveryId: null }).session(session)
       if (!funding) throw conflict("A reserved rider fee is required.")
@@ -100,9 +101,11 @@ router.post("/:orderId/dispatch", protect, async (req, res) => {
         { $set: { fulfillmentStatus: "delivery_in_progress" } }, { session })
       if (moved.modifiedCount !== 1) throw conflict("Order changed during dispatch.")
       result = { deliveryId: String(delivery._id), orderId: String(order._id), status: "pending",
-        deliveryFee: funding.quotedFee, environment: mode, simulated: mode === "testing",
+        deliveryFee: funding.quotedFee, distanceKm: funding.distanceKm, environment: mode, simulated: mode === "testing",
         message: mode === "testing" ? "TEST ONLY: rider job created; no actual payment or payout." : "Rider request posted; payout requires buyer confirmation." }
     })
+    // Tell online riders of the matching mode straight away (test jobs go to test riders only).
+    notifyOnlineRiders(req.app, { _id: result.deliveryId, itemTitle: "Grouped checkout order", itemImage: "", distanceKm: result.distanceKm, deliveryFee: result.deliveryFee, status: "pending", createdAt: new Date() }, { testing: result.environment === "testing" })
     return res.status(201).json(result)
   } catch (e) {
     return res.status(e.code === 11000 ? 409 : e.status || 500).json({ message: e.status ? e.message : e.code === 11000 ? "Delivery already exists." : "Dispatch failed; no rider job committed." })
