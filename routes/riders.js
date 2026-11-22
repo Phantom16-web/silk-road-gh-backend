@@ -1,11 +1,12 @@
 import express from 'express'
 import Rider from '../models/Rider.js'
 import upload from '../middleware/upload.js'
+import { syncRiderOnlineRoom } from '../services/notify.js'
 import { requireAdminAuth, requirePermission } from '../middleware/adminAuth.js'
 
 const router=express.Router()
 router.get('/',async(req,res)=>{
-  try {const riders=await Rider.find({isApproved:true,isActive:true,photoReviewStatus:'approved',photoUrl:{$type:'string',$ne:''}})
+  try {const riders=await Rider.find({isApproved:true,isActive:true,isTestRider:{$ne:true},photoReviewStatus:'approved',photoUrl:{$type:'string',$ne:''}})
     .select('name vehicle rating ratingCount isOnline university photoUrl createdAt').sort({createdAt:-1}).lean()
     return res.json(riders)
   }catch(err){console.error(err);return res.status(500).json({message:'Unable to retrieve riders.'})}
@@ -28,18 +29,22 @@ router.get('/admin/review',requireAdminAuth,requirePermission('manage_riders'),a
 })
 router.put('/:id/status',requireAdminAuth,requirePermission('manage_riders'),async(req,res)=>{
   try {const rider=await Rider.findById(req.params.id);if(!rider)return res.status(404).json({message:'Rider not found.'})
-    const {isActive,isApproved,isOnline,photoReviewStatus}=req.body||{}
-    for(const [key,value] of Object.entries({isActive,isApproved,isOnline}))if(value!==undefined&&typeof value!=='boolean')return res.status(400).json({message:`${key} must be boolean.`})
+    const {isActive,isApproved,isOnline,isTestRider,photoReviewStatus}=req.body||{}
+    for(const [key,value] of Object.entries({isActive,isApproved,isOnline,isTestRider}))if(value!==undefined&&typeof value!=='boolean')return res.status(400).json({message:`${key} must be boolean.`})
     if(photoReviewStatus!==undefined&&!['approved','rejected','pending'].includes(photoReviewStatus))return res.status(400).json({message:'Invalid photo review status.'})
     if(photoReviewStatus==='approved'&&!rider.photoUrl)return res.status(409).json({message:'Cannot approve without an uploaded photograph.'})
     if(photoReviewStatus!==undefined){rider.photoReviewStatus=photoReviewStatus;rider.photoReviewedAt=new Date()}
     if(isApproved===true&&(!rider.photoUrl||rider.photoReviewStatus!=='approved'))return res.status(409).json({message:'Approve the photograph before approving rider.'})
     if(isApproved!==undefined)rider.isApproved=isApproved
     if(isActive!==undefined)rider.isActive=isActive
+    if(isTestRider!==undefined&&isTestRider!==!!rider.isTestRider){
+      if(rider.activeDelivery)return res.status(409).json({message:'Rider has an active delivery. Finish or cancel it before switching test/live mode.'})
+      rider.isTestRider=isTestRider;rider.isOnline=false
+    }
     if(isOnline===true&&(!rider.isApproved||!rider.isActive||rider.photoReviewStatus!=='approved'))return res.status(409).json({message:'Rider must be active and fully approved before going online.'})
     if(isOnline!==undefined)rider.isOnline=isOnline
     if(!rider.isApproved||!rider.isActive||rider.photoReviewStatus!=='approved')rider.isOnline=false
-    await rider.save();return res.json({message:'Rider review updated.',rider:{id:rider.id,name:rider.name,isActive:rider.isActive,isApproved:rider.isApproved,isOnline:rider.isOnline,photoUrl:rider.photoUrl,photoReviewStatus:rider.photoReviewStatus}})
+    await rider.save();syncRiderOnlineRoom(req.app,rider._id,rider.isOnline,rider.isTestRider);return res.json({message:'Rider review updated.',rider:{id:rider.id,name:rider.name,isTestRider:!!rider.isTestRider,isActive:rider.isActive,isApproved:rider.isApproved,isOnline:rider.isOnline,photoUrl:rider.photoUrl,photoReviewStatus:rider.photoReviewStatus}})
   }catch(err){console.error(err);return res.status(500).json({message:'Unable to update rider.'})}
 })
 export default router
