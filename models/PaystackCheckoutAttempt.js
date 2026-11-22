@@ -7,6 +7,9 @@ const schema = new mongoose.Schema({
   currency: { type: String, enum: ['GHS'], default: 'GHS' },
   state: { type: String, enum: ['initializing','pending','verified','failed','reconcile'], default: 'initializing' },
   authorizationUrl: { type: String, default: null },
+  // 'checkout' = Paystack hosted page, 'mobile_money' = direct charge from the buyer's phone number.
+  channel: { type: String, enum: ['checkout','mobile_money'], default: 'checkout' },
+  chargeStatus: { type: String, default: null },
   verifiedAt: { type: Date, default: null },
   providerId: { type: String, default: null },
   lastError: { type: String, default: null },
