@@ -15,6 +15,10 @@ const newReference = () => `SR-GRP-${crypto.randomBytes(16).toString('hex').toUp
 // A mobile money prompt expires after about 3 minutes. After this long with no payment we treat the attempt as dead.
 const PROMPT_WINDOW_MS = 4 * 60 * 1000
 const STALE_MS = 10 * 60 * 1000
+// With a Paystack TEST key (Testing Mode) there is no real phone to prompt, so payments are approved automatically,
+// exactly like the Owner's "simulate payment" tool. Set PAYSTACK_TEST_AUTO_APPROVE=false to use Paystack's own test flow instead.
+// A live key can NEVER take this path: it needs a test key AND a Testing Mode checkout.
+const autoApproveTest = env => env === 'test' && process.env.PAYSTACK_TEST_AUTO_APPROVE !== 'false'
 
 // Keeps Paystack's HTTP status so we can tell "Paystack understood and refused this request" (nothing was charged,
 // safe to retry) from "we do not know what happened" (must be reconciled, never retried blindly).
@@ -55,6 +59,7 @@ async function loadPayableGroup(req) {
 router.post('/:checkoutId/charge', async (req,res) => {
   try {
     const { group, env } = await loadPayableGroup(req)
+    if (autoApproveTest(env)) return res.status(201).json(await approveTestCheckout(group))
     const phone = normalizeGhPhone(req.body?.phone || group.payerPhone)
     if (!phone.ok) throw fail('Please enter a valid Ghana Mobile Money number.',400)
     const wanted = typeof req.body?.provider === 'string' ? req.body.provider.toLowerCase() : ''
@@ -114,6 +119,7 @@ router.post('/:checkoutId/submit-otp', async (req,res) => {
 router.post('/:checkoutId/initialize', async (req,res) => {
   try {
     const { group, env } = await loadPayableGroup(req)
+    if (autoApproveTest(env)) return res.status(201).json(await approveTestCheckout(group))
     const email = await receiptEmail()
     const existing = await PaystackCheckoutAttempt.findOne({ checkoutId: group.id })
     if (existing) return res.status(existing.authorizationUrl ? 200 : 409).json({ reference: existing.reference, authorizationUrl: existing.authorizationUrl, state: existing.state, message: existing.authorizationUrl ? 'Existing payment attempt' : 'A payment attempt already exists. Check its status instead of starting a new one.' })
@@ -171,6 +177,36 @@ async function recordChargeOutcome(attempt, data) {
   return { ...base, state: 'pending', needsOtp: status === 'send_otp' }
 }
 
+// Testing Mode only. Approves the whole grouped checkout in one all-or-nothing step, the same way the Owner's
+// "simulate payment" tool does for a single order: no Paystack call, no Payment record (that would look like real money),
+// orders marked simulated and "In Test Escrow", and paymentVerifiedAt left empty.
+async function approveTestCheckout(group) {
+  const reference = `SR-TEST-${crypto.randomBytes(12).toString('hex').toUpperCase()}`
+  const amountMinor = minor(group.amount)
+  const session = await mongoose.startSession()
+  try {
+    let output
+    await session.withTransaction(async () => {
+      const fresh = await CheckoutGroup.findById(group.id).session(session)
+      if (!fresh) throw fail('Checkout missing',404)
+      if (fresh.status === 'verified') { output = { verified:true, state:'verified', alreadyVerified:true, simulated:true }; return }
+      if (fresh.status !== 'pending' || fresh.paymentMethod !== 'paystack' || fresh.environment !== 'testing') throw fail('Checkout is no longer eligible')
+      const orders = await Order.find({ _id:{ $in:fresh.orderIds } }).session(session)
+      if (orders.length !== fresh.orderIds.length || orders.some(o => o.paymentStatus !== 'pending' || o.paymentMethod !== 'paystack' || o.environment !== 'testing' || o.cancelled || o.fulfillmentStatus !== 'pending_payment')) throw fail('Order states conflict')
+      if (orders.reduce((sum,o)=>sum+minor(o.amount),0) !== amountMinor || minor(fresh.amount) !== amountMinor) throw fail('Allocation amount mismatch')
+      if (await Payment.exists({ order:{ $in:fresh.orderIds } }).session(session)) throw fail('An order already has a payment record and cannot be simulated.')
+      const now = new Date()
+      const updated = await Order.updateMany({ _id:{ $in:fresh.orderIds }, paymentStatus:'pending', paymentMethod:'paystack', environment:'testing', isSimulatedPayment:{ $ne:true } }, { $set:{ isSimulatedPayment:true, simulatedPaymentAt:now, paymentStatus:'escrow_held', fulfillmentStatus:'awaiting_delivery', status:'In Test Escrow', paymentVerifiedAt:null, paystackRef:reference } }, { session })
+      if (updated.modifiedCount !== orders.length) throw fail('Order update conflict')
+      fresh.status = 'verified'; fresh.paymentReference = reference; fresh.verifiedAt = now; fresh.verifiedBy = 'test:auto-approve'
+      await fresh.save({ session })
+      await PaystackCheckoutAttempt.findOneAndUpdate({ checkoutId: fresh.id }, { $set:{ reference, environment:'test', amountMinor, state:'verified', channel:'mobile_money', chargeStatus:'simulated', verifiedAt:now, lastError:null } }, { upsert:true, session })
+      output = { verified:true, state:'verified', simulated:true, orderCount:orders.length, reference }
+    })
+    return output
+  } finally { await session.endSession() }
+}
+
 // Idempotent, all-or-nothing allocation of one Paystack group charge across orders.
 export async function reconcilePaystackGroup(reference) {
   const attempt = await PaystackCheckoutAttempt.findOne({ reference })
@@ -195,7 +231,7 @@ export async function reconcilePaystackGroup(reference) {
       if (existing) throw fail('Existing payment allocation must be reconciled')
       const now = new Date()
       await Payment.insertMany(orders.map(o=>({ order:o.id, buyer:o.buyer, method:'paystack', provider:'paystack', status:'verified', amount:o.amount, currency:'GHS', providerReference:reference, verifiedAt:now, notes:`Paystack checkout ${group.id} (${attempt.environment})` })), { session })
-      const updated = await Order.updateMany({ _id:{ $in:group.orderIds }, paymentStatus:'pending', paymentMethod:'paystack' }, { $set:{ paymentStatus:'escrow_held', paymentVerifiedAt:now, fulfillmentStatus:'awaiting_delivery', status:'In Escrow', paystackRef:reference } }, { session })
+      const updated = await Order.updateMany({ _id:{ $in:group.orderIds }, paymentStatus:'pending', paymentMethod:'paystack' }, { $set:{ paymentStatus:'escrow_held', paymentVerifiedAt:attempt.environment === 'test' ? null : now, fulfillmentStatus:'awaiting_delivery', status:attempt.environment === 'test' ? 'In Test Escrow' : 'In Escrow', paystackRef:reference, ...(attempt.environment === 'test' ? { isSimulatedPayment:true, simulatedPaymentAt:now } : {}) } }, { session })
       if (updated.modifiedCount !== orders.length) throw fail('Order update conflict')
       group.status='verified'; group.paymentReference=reference; group.verifiedAt=now; group.verifiedBy=`paystack:${attempt.environment}`
       await group.save({ session })
@@ -212,6 +248,7 @@ router.post('/:checkoutId/verify', async (req,res) => {
     if (!checkoutClaim(req.headers['x-checkout-token'],group.claimTokenHash)) throw fail('Not authorized',403)
     const attempt = await PaystackCheckoutAttempt.findOne({ checkoutId:group.id }).sort({ createdAt:-1 })
     if (!attempt) throw fail('Payment not initialized',404)
+    if (attempt.state === 'verified' && group.status === 'verified') return res.json({ verified:true, alreadyVerified:true })
     const outcome = await reconcilePaystackGroup(attempt.reference)
     if (outcome.verified) return res.json(outcome)
     if (outcome.providerStatus === 'failed') await PaystackCheckoutAttempt.updateOne({ _id: attempt.id, state: { $ne: 'verified' } }, { $set: { state:'failed' } })
