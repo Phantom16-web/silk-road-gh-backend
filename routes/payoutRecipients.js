@@ -6,6 +6,8 @@ import Rider from '../models/Rider.js'
 import PayoutRecipient from '../models/PayoutRecipient.js'
 import {requireAdminAuth,requireOwner,requireReAuth,logAction} from '../middleware/adminAuth.js'
 import {createTransferRecipient,paystackKeyMode} from '../services/paystackTransfers.js'
+import {sweepSettlements} from '../services/autoSettlement.js'
+import {normalizeGhPhone} from '../services/ghPhone.js'
 const router=express.Router()
 const respond=(fn)=>(req,res)=>Promise.resolve(fn(req,res)).catch(e=>{console.error('Recipient onboarding:',e);res.status(e.status||503).json({message:e.status?e.message:'Recipient verification unavailable; contact support.'})})
 const fail=(m,status=400)=>Object.assign(new Error(m),{status})
@@ -23,11 +25,33 @@ router.post('/me',respond(async(req,res)=>{
  if(!beneficiary||(role==='rider'&&(!beneficiary.isApproved||!beneficiary.isActive)))throw fail('Eligible account required',403)
  const environment=paystackKeyMode()
  if(!['test','live'].includes(environment))throw fail('Paystack not configured',503)
- const existing=await PayoutRecipient.findOne({beneficiary:id,role,environment})
- if(existing?.status==='approved')throw fail('Approved payout destinations cannot be changed here; contact support',409)
- if(existing?.status==='pending_review')throw fail('Payout destination is awaiting review',409)
- await PayoutRecipient.findOneAndUpdate({beneficiary:id,role,environment},{ $set:{accountName:accountName.trim(),accountNumber:accountNumber.trim(),bankCode:bankCode.trim(),type,status:'pending_review',recipientCode:null,reviewedAt:null,reviewedBy:null,reviewEvidence:null} },{upsert:true,new:true,runValidators:true})
- res.status(201).json({status:'pending_review',message:'Payout destination submitted for independent Owner review. No transfer has been made.'})
+ const existing=await PayoutRecipient.findOne({beneficiary:id,role,environment}).select('+accountNumber')
+ const number=type==='mobile_money'?(normalizeGhPhone(accountNumber).local||accountNumber.trim()):accountNumber.trim()
+ if(existing?.status==='approved'&&existing.accountNumber===number&&existing.bankCode===bankCode.trim())return res.json({status:'approved',message:'This payout account is already active.'})
+ // Created at Paystack straight away. In Testing Mode nothing is sent to Paystack because test payouts are simulated.
+ let recipientCode='RCP_TESTSIM'
+ if(environment==='live'){
+  const provider=await createTransferRecipient({name:accountName.trim(),accountNumber:number,bankCode:bankCode.trim(),type})
+  if(!/^RCP_[A-Za-z0-9]+$/.test(provider.recipient_code||''))throw fail('Paystack could not verify this account. Check the number and network.',503)
+  recipientCode=provider.recipient_code
+ }
+ // Changing an active destination pauses payouts to the new one for 24 hours, so a hijacked session cannot redirect money quickly.
+ const holdUntil=existing?.status==='approved'&&environment==='live'?new Date(Date.now()+24*3600*1000):null
+ await PayoutRecipient.findOneAndUpdate({beneficiary:id,role,environment},{ $set:{accountName:accountName.trim(),accountNumber:number,bankCode:bankCode.trim(),type,status:'approved',recipientCode,reviewedAt:new Date(),reviewedBy:'system:auto',reviewEvidence:'Self-service destination, verified by Paystack recipient creation',holdUntil} },{upsert:true,new:true,runValidators:true})
+ sweepSettlements().catch(()=>{})
+ res.status(201).json({status:'approved',holdUntil,message:holdUntil?'Saved. For your protection payouts to this new account start in 24 hours.':'Payout account saved. Your money is sent here automatically after each confirmed delivery.'})
+}))
+// What the owner of the account sees on their Payouts screen (the full number is never returned).
+router.get('/me/summary',respond(async(req,res)=>{
+ const token=req.headers.authorization?.match(/^Bearer (.+)$/)?.[1]
+ let id
+ try{id=jwt.verify(token||'',process.env.JWT_SECRET)?.id}catch{throw fail('Login required',401)}
+ if(!mongoose.isValidObjectId(id))throw fail('Invalid login',401)
+ const role=req.query.role==='rider'?'rider':'seller'
+ const environment=paystackKeyMode()
+ const row=['test','live'].includes(environment)?await PayoutRecipient.findOne({beneficiary:id,role,environment}).select('+accountNumber').lean():null
+ const n=row?.accountNumber||''
+ res.json({environment,configured:Boolean(row&&row.status==='approved'),recipient:row?{accountName:row.accountName,bankCode:row.bankCode,type:row.type,numberMasked:n.length>=7?`${n.slice(0,3)} \u2022\u2022\u2022 ${n.slice(-4)}`:'\u2022\u2022\u2022\u2022',holdUntil:row.holdUntil||null}:null})
 }))
 router.get('/owner/pending',requireAdminAuth,requireOwner,respond(async(req,res)=>{
  const rows=await PayoutRecipient.find({status:'pending_review'}).select('-accountNumber').limit(100).lean()
