@@ -7,6 +7,7 @@ import Payment from '../models/Payment.js'
 import PaystackCheckoutAttempt from '../models/PaystackCheckoutAttempt.js'
 import { getPaystackReceiptEmail } from '../models/PaymentSettings.js'
 import { normalizeGhPhone, momoProvider, MOMO_PROVIDERS, maskPhone } from '../services/ghPhone.js'
+import { notifyOrdersPaid } from '../services/orderEvents.js'
 import { minor, keyEnvironment, checkoutClaim, matchesProviderTransaction } from '../services/paystackCheckoutCore.js'
 const router = express.Router()
 const secret = () => process.env.PAYSTACK_SECRET_KEY || ''
@@ -185,7 +186,7 @@ async function approveTestCheckout(group) {
   const amountMinor = minor(group.amount)
   const session = await mongoose.startSession()
   try {
-    let output
+    let output, paid = null
     await session.withTransaction(async () => {
       const fresh = await CheckoutGroup.findById(group.id).session(session)
       if (!fresh) throw fail('Checkout missing',404)
@@ -202,7 +203,9 @@ async function approveTestCheckout(group) {
       await fresh.save({ session })
       await PaystackCheckoutAttempt.findOneAndUpdate({ checkoutId: fresh.id }, { $set:{ reference, environment:'test', amountMinor, state:'verified', channel:'mobile_money', chargeStatus:'simulated', verifiedAt:now, lastError:null } }, { upsert:true, session })
       output = { verified:true, state:'verified', simulated:true, orderCount:orders.length, reference }
+      paid = { ids: fresh.orderIds, checkoutId: fresh.id }
     })
+    if (paid) notifyOrdersPaid(paid.ids, paid.checkoutId)
     return output
   } finally { await session.endSession() }
 }
@@ -215,7 +218,7 @@ export async function reconcilePaystackGroup(reference) {
   if (!matchesProviderTransaction(tx,attempt)) return { verified:false, providerStatus:tx?.status || 'unknown' }
   const session = await mongoose.startSession()
   try {
-    let output
+    let output, paid = null
     await session.withTransaction(async () => {
       const group = await CheckoutGroup.findById(attempt.checkoutId).session(session)
       if (!group) throw fail('Checkout missing',404)
@@ -237,7 +240,9 @@ export async function reconcilePaystackGroup(reference) {
       await group.save({ session })
       await PaystackCheckoutAttempt.updateOne({ _id:attempt.id }, { $set:{ state:'verified', verifiedAt:now, providerId:String(tx.id || '') } }, { session })
       output = { verified:true, orderCount:orders.length }
+      paid = { ids: group.orderIds, checkoutId: group.id }
     })
+    if (paid) notifyOrdersPaid(paid.ids, paid.checkoutId)
     return output
   } finally { await session.endSession() }
 }
