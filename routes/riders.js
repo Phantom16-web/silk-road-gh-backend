@@ -1,7 +1,7 @@
 import express from 'express'
 import Rider from '../models/Rider.js'
 import upload from '../middleware/upload.js'
-import { syncRiderOnlineRoom } from '../services/notify.js'
+import { syncRiderOnlineRoom, notify } from '../services/notify.js'
 import { requireAdminAuth, requirePermission } from '../middleware/adminAuth.js'
 
 const router=express.Router()
@@ -44,7 +44,10 @@ router.put('/:id/status',requireAdminAuth,requirePermission('manage_riders'),asy
     if(isOnline===true&&(!rider.isApproved||!rider.isActive||rider.photoReviewStatus!=='approved'))return res.status(409).json({message:'Rider must be active and fully approved before going online.'})
     if(isOnline!==undefined)rider.isOnline=isOnline
     if(!rider.isApproved||!rider.isActive||rider.photoReviewStatus!=='approved')rider.isOnline=false
-    await rider.save();syncRiderOnlineRoom(req.app,rider._id,rider.isOnline,rider.isTestRider);return res.json({message:'Rider review updated.',rider:{id:rider.id,name:rider.name,isTestRider:!!rider.isTestRider,isActive:rider.isActive,isApproved:rider.isApproved,isOnline:rider.isOnline,photoUrl:rider.photoUrl,photoReviewStatus:rider.photoReviewStatus}})
+    await rider.save();syncRiderOnlineRoom(req.app,rider._id,rider.isOnline,rider.isTestRider)
+    if(photoReviewStatus==='approved'&&rider.isApproved)notify(req.app,{recipient:rider._id,recipientModel:'Rider',type:'rider_approved',title:'You are approved',message:'Your identity was verified. Go online to start receiving delivery jobs.',dedupeKey:`rider_approved:${rider._id}:${rider.photoReviewedAt?.getTime()}`})
+    if(photoReviewStatus==='rejected')notify(req.app,{recipient:rider._id,recipientModel:'Rider',type:'rider_rejected',title:'Identity review needs attention',message:'We could not approve your photo. Please upload a clear, well-lit photo of your face and apply again, or contact support.',dedupeKey:`rider_rejected:${rider._id}:${rider.photoReviewedAt?.getTime()}`})
+    return res.json({message:'Rider review updated.',rider:{id:rider.id,name:rider.name,isTestRider:!!rider.isTestRider,isActive:rider.isActive,isApproved:rider.isApproved,isOnline:rider.isOnline,photoUrl:rider.photoUrl,photoReviewStatus:rider.photoReviewStatus}})
   }catch(err){console.error(err);return res.status(500).json({message:'Unable to update rider.'})}
 })
 export default router
