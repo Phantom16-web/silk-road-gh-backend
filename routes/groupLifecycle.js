@@ -17,6 +17,8 @@ import RiderFundingChoice from "../models/RiderFundingChoice.js"
 import GroupAuditEvent from "../models/GroupAuditEvent.js"
 import Payment from "../models/Payment.js"
 import { getEnvironmentMode } from "../models/Environment.js"
+import { notifyDeliveryCode, notifyDeliveryConfirmed } from "../services/orderEvents.js"
+import { autoSettleOrder } from "../services/autoSettlement.js"
 const router = express.Router()
 router.use("/rider-funding", groupRiderFunding)
 const error = (message, status = 409) => Object.assign(new Error(message), { status })
@@ -49,6 +51,8 @@ async function runTransaction(res, callback) {
   try {
     let result
     await session.withTransaction(async () => { result = await callback(session) })
+    // Post-commit side effects (notifications, automatic payout). They never block or fail the response.
+    if (typeof res.locals?.after === "function") { try { res.locals.after(result) } catch (err) { console.error("after hook failed:", err.message) } }
     return res.json(result)
   } catch (e) {
     console.error("Group lifecycle operation failed:", e)
@@ -61,18 +65,32 @@ router.get("/seller/orders", protect, async (req,res)=>{
     const orders=await Order.find({
       seller:req.user.id,
       paymentStatus:{$in:["escrow_held","release_pending","released"]}
-    }).select("_id seller listing amount sellerAmount paymentStatus fulfillmentStatus environment createdAt payerName payerPhone location landmark deliveryMethod").sort({createdAt:-1}).limit(200).lean()
+    }).select("_id seller listing amount sellerAmount paymentStatus fulfillmentStatus environment createdAt payerName payerPhone location landmark deliveryMethod").populate("listing","title image images").sort({createdAt:-1}).limit(200).lean()
     if(!orders.length)return res.json({orders:[]})
     const groups=await CheckoutGroup.find({orderIds:{$in:orders.map(o=>o._id)}}).select("_id orderIds status environment").lean()
     const groupByOrder=new Map()
     for(const group of groups)for(const id of group.orderIds)if(!groupByOrder.has(String(id)))groupByOrder.set(String(id),group)
-    const results=orders.filter(o=>groupByOrder.has(String(o._id))).map(o=>({
-      orderId:String(o._id),checkoutId:groupByOrder.get(String(o._id))._id,
-      listingId:String(o.listing),amount:o.amount,sellerAmount:o.sellerAmount,
-      paymentStatus:o.paymentStatus,fulfillmentStatus:o.fulfillmentStatus,
-      groupStatus:groupByOrder.get(String(o._id)).status,environment:o.environment,
-      createdAt:o.createdAt,deliveryMethod:o.deliveryMethod
-    }))
+    const ids=orders.map(o=>o._id)
+    const [fundings,deliveries]=await Promise.all([
+      RiderFundingChoice.find({order:{$in:ids}}).select("order status quotedFee").lean(),
+      Delivery.find({order:{$in:ids},status:{$ne:"cancelled"}}).sort({createdAt:-1}).select("order status deliveryFee rider pickedUpAt").populate("rider","name vehicle photoUrl phone").lean(),
+    ])
+    const fundingByOrder=new Map(fundings.map(f=>[String(f.order),f]))
+    const deliveryByOrder=new Map();for(const d of deliveries)if(!deliveryByOrder.has(String(d.order)))deliveryByOrder.set(String(d.order),d)
+    const results=orders.filter(o=>groupByOrder.has(String(o._id))).map(o=>{
+      const f=fundingByOrder.get(String(o._id)),d=deliveryByOrder.get(String(o._id))
+      return {
+        orderId:String(o._id),checkoutId:groupByOrder.get(String(o._id))._id,
+        listingId:String(o.listing?._id||o.listing),itemTitle:o.listing?.title||"Item",itemImage:o.listing?.image||o.listing?.images?.[0]||"",
+        amount:o.amount,sellerAmount:o.sellerAmount,
+        paymentStatus:o.paymentStatus,fulfillmentStatus:o.fulfillmentStatus,
+        groupStatus:groupByOrder.get(String(o._id)).status,environment:o.environment,
+        createdAt:o.createdAt,deliveryMethod:o.deliveryMethod,
+        buyerName:o.payerName||"Buyer",buyerPhone:o.payerPhone||"",location:o.location||"",landmark:o.landmark||"",
+        riderFunding:f?{status:f.status,quotedFee:f.quotedFee}:null,
+        delivery:d?{id:String(d._id),status:d.status,fee:d.deliveryFee,rider:d.rider?{name:d.rider.name,vehicle:d.rider.vehicle,phone:d.rider.phone||"",photoUrl:d.rider.photoUrl||""}:null}:null,
+      }
+    })
     return res.json({orders:results})
   }catch(e){console.error("Seller grouped orders error",e);return res.status(500).json({message:"Unable to load grouped sales."})}
 })
@@ -181,6 +199,7 @@ router.post("/:checkoutId/resolve-dispute", requireAdminAuth, requirePermission(
 })
 // Buyer generates a short-lived, order-specific delivery code. It is NEVER sent to the seller by this endpoint.
 router.post("/:checkoutId/orders/:orderId/delivery-code", async (req, res) => {
+  res.locals.after = r => { if (r?.orderId) notifyDeliveryCode(r.orderId) }
   if (!isId(req.params.orderId)) return res.status(400).json({ message: "Invalid order ID." })
   return runTransaction(res, async session => {
     const group = await CheckoutGroup.findById(req.params.checkoutId).select("+claimTokenHash").session(session)
@@ -198,6 +217,7 @@ router.post("/:checkoutId/orders/:orderId/delivery-code", async (req, res) => {
 })
 // Authenticated seller enters the buyer's code; this confirms only that seller's order.
 router.post("/:checkoutId/orders/:orderId/confirm-delivery", protect, async (req, res) => {
+  res.locals.after = r => { if (r?.verified) { notifyDeliveryConfirmed(r.orderId); autoSettleOrder(r.orderId) } }
   if (!isId(req.params.orderId) || !/^\d{6}$/.test(String(req.body?.deliveryCode || ""))) return res.status(400).json({ message: "Valid order ID and six-digit delivery code required." })
   return runTransaction(res, async session => {
     const group = await CheckoutGroup.findById(req.params.checkoutId).session(session)
@@ -217,7 +237,7 @@ router.post("/:checkoutId/orders/:orderId/confirm-delivery", protect, async (req
     const updated = await Order.updateOne({ _id: order._id, paymentStatus: "escrow_held", fulfillmentStatus: { $in: ["awaiting_delivery", "delivery_in_progress", "delivered_pending_otp"] } }, { $set: { fulfillmentStatus: "completed", paymentStatus: "release_pending", completedAt: now, status: "Delivery Confirmed — Payout Pending" } }, { session })
     if (updated.modifiedCount !== 1) throw error("Order changed during confirmation.")
     record.confirmedAt = now; record.otpHash = null; await record.save({ session })
-    return { verified: true, orderId: order.id, paymentStatus: "release_pending", message: "Delivery confirmed. No payout has been sent yet." }
+    return { verified: true, orderId: order.id, paymentStatus: "release_pending", message: "Delivery confirmed. The seller\u2019s payout is being released automatically." }
   })
 })
 // Rider-only lookup. Never return the buyer claim token or OTP.
@@ -244,6 +264,7 @@ router.post("/:checkoutId/orders/:orderId/confirm-rider-delivery", async (req,re
   try { if (!auth.startsWith("Bearer ") || !process.env.JWT_SECRET) throw Error(); riderId=jwt.verify(auth.slice(7),process.env.JWT_SECRET)?.id }
   catch { return res.status(401).json({message:"Rider authentication required."}) }
   if (!isId(riderId) || !await Rider.exists({_id:riderId,isActive:true,isApproved:true})) return res.status(403).json({message:"Approved rider required."})
+  res.locals.after = r => { if (r?.verified) { notifyDeliveryConfirmed(r.orderId, riderId); autoSettleOrder(r.orderId) } }
   return runTransaction(res,async session=>{
     const group=await CheckoutGroup.findById(req.params.checkoutId).session(session)
     const mode = group ? await deliveryModeFor(group) : null
