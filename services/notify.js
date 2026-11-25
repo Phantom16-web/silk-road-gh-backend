@@ -7,6 +7,11 @@ export const riderRoom = id => `rider:${id}`
 export const ONLINE_RIDERS_ROOM = "riders:online"
 export const ONLINE_TEST_RIDERS_ROOM = "riders:online:test"
 
+// server.js registers the socket server once, so code with no request (webhook workers, sweepers) can notify too.
+let ioRef = null
+export const registerIo = io => { ioRef = io }
+const getIo = app => app?.get?.("io") || ioRef
+
 const toId = v => (v && mongoose.isValidObjectId(String(v)) ? String(v) : null)
 
 /**
@@ -40,15 +45,14 @@ export async function notify(app, {
       throw err
     }
 
-    const io = app?.get?.("io")
+    const io = getIo(app)
     if (io) {
       const room = recipientModel === "Rider" ? riderRoom(to) : userRoom(to)
-      const payload = {
-        ...data, ...live, message, title, type,
-        notificationId: String(doc._id), createdAt: doc.createdAt,
-      }
+      const publicPayload = { ...data, message, title, type, notificationId: String(doc._id), createdAt: doc.createdAt }
+      const payload = { ...publicPayload, ...live }
       io.to(room).emit(type, payload)
       for (const alias of aliases) io.to(room).emit(alias, payload)
+      io.to(room).emit("notification", publicPayload) // one generic event the bell and toasts listen to (never carries secrets)
     }
     return doc
   } catch (err) {
@@ -61,14 +65,14 @@ export async function notify(app, {
 // test riders only; live jobs go to real riders only, so the two never mix.
 export function notifyOnlineRiders(app, jobPayload, { testing = false } = {}) {
   try {
-    app?.get?.("io")?.to(testing ? ONLINE_TEST_RIDERS_ROOM : ONLINE_RIDERS_ROOM).emit("new_delivery_job", jobPayload)
+    getIo(app)?.to(testing ? ONLINE_TEST_RIDERS_ROOM : ONLINE_RIDERS_ROOM).emit("new_delivery_job", jobPayload)
   } catch (err) { console.error("notifyOnlineRiders error:", err.message) }
 }
 
 // Call after a rider's online/approved state changes so live job pushes follow it.
 export function syncRiderOnlineRoom(app, riderId, shouldBeOnline, isTestRider = false) {
   try {
-    const io = app?.get?.("io")
+    const io = getIo(app)
     const id = toId(riderId)
     if (!io || !id) return
     const sockets = io.in(riderRoom(id))
