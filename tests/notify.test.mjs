@@ -30,7 +30,8 @@ test("OTP is emitted live but never stored", async () => {
   await notify(app, { recipient: ID, type: "delivery_otp_ready", data: { deliveryId: ID }, live: { otp: "123456" }, aliases: ["delivery_otp"] })
   restore()
   assert.ok(!JSON.stringify(saved).includes("123456"))
-  assert.deepEqual(emitted.map(e => e.event), ["delivery_otp_ready", "delivery_otp"])
+  assert.deepEqual(emitted.map(e => e.event), ["delivery_otp_ready", "delivery_otp", "notification"])
+  assert.equal(emitted[2].payload.otp, undefined) // the generic event never carries the code
   assert.equal(emitted[0].payload.otp, "123456")
 })
 
