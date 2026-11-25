@@ -7,7 +7,8 @@ import Order from "../models/Order.js"
 import RiderFundingChoice from "../models/RiderFundingChoice.js"
 import { getEnvironmentMode } from "../models/Environment.js"
 import { haversineKm, calculateDeliveryFee } from "../utils/distance.js"
-import { notifyOnlineRiders } from "../services/notify.js"
+import { notifyOnlineRiders, notify } from "../services/notify.js"
+import Listing from "../models/Listing.js"
 
 const router = express.Router()
 const money = value => Math.round(Number(value) * 100) / 100
@@ -43,7 +44,9 @@ router.post("/:orderId/choose", protect, async (req, res) => {
     let result
     await session.withTransaction(async () => {
       const { order, group, mode } = await eligibleOrder(req.params.orderId, req.user.id, session)
-      if (await RiderFundingChoice.exists({ order: order._id }).session(session)) throw conflict("A funding choice already exists.")
+      const prior = await RiderFundingChoice.findOne({ order: order._id }).session(session)
+      if (prior && prior.status !== "cancelled") throw conflict("A funding choice already exists.")
+      if (prior) await RiderFundingChoice.deleteOne({ _id: prior._id }, { session }) // a cancelled rider request can be made again
       const distanceKm = haversineKm(a, b, c, d)
       const quotedFee = money(calculateDeliveryFee(distanceKm))
       if (!Number.isFinite(quotedFee) || quotedFee <= 0) throw conflict("Invalid delivery fee.")
@@ -78,9 +81,11 @@ router.post("/:orderId/dispatch", protect, async (req, res) => {
   if (sellerContact.length > 40 || buyerContact.length > 40) return res.status(400).json({ message: "Invalid contact details." })
   const session = await mongoose.startSession()
   try {
-    let result
+    let result, buyerId = null, jobTitle = "Delivery order", jobImage = ""
     await session.withTransaction(async () => {
       const { order, group, mode } = await eligibleOrder(req.params.orderId, req.user.id, session)
+      const listing = await Listing.findById(order.listing).select("title image images").session(session)
+      jobTitle = listing?.title || "Delivery order"; jobImage = listing?.image || listing?.images?.[0] || ""; buyerId = order.buyer || null
       // Testing Mode jobs are only visible to, and acceptable by, test rider accounts (see routes/deliveries.js).
       const funding = await RiderFundingChoice.findOne({ order: order._id, seller: order.seller,
         checkoutId: group.id, fundingSource: "earnings", status: "reserved", deliveryId: null }).session(session)
@@ -93,7 +98,7 @@ router.post("/:orderId/dispatch", protect, async (req, res) => {
         seller: order.seller, buyer: order.buyer || null, pickupLocation: funding.pickupLocation,
         dropLocation: funding.dropLocation, sellerContact, buyerContact,
         distanceKm: funding.distanceKm, deliveryFee: funding.quotedFee,
-        deliveryType: "rider", status: "pending", itemTitle: "Grouped checkout order" }], { session })
+        deliveryType: "rider", status: "pending", itemTitle: jobTitle, itemImage: jobImage }], { session })
       const changed = await RiderFundingChoice.updateOne({ _id: funding._id, status: "reserved", deliveryId: null },
         { $set: { status: "dispatched", deliveryId: delivery._id } }, { session })
       if (changed.modifiedCount !== 1) throw conflict("Funding changed during dispatch.")
@@ -105,7 +110,8 @@ router.post("/:orderId/dispatch", protect, async (req, res) => {
         message: mode === "testing" ? "TEST ONLY: rider job created; no actual payment or payout." : "Rider request posted; payout requires buyer confirmation." }
     })
     // Tell online riders of the matching mode straight away (test jobs go to test riders only).
-    notifyOnlineRiders(req.app, { _id: result.deliveryId, itemTitle: "Grouped checkout order", itemImage: "", distanceKm: result.distanceKm, deliveryFee: result.deliveryFee, status: "pending", createdAt: new Date() }, { testing: result.environment === "testing" })
+    notifyOnlineRiders(req.app, { _id: result.deliveryId, itemTitle: jobTitle, itemImage: jobImage, distanceKm: result.distanceKm, deliveryFee: result.deliveryFee, status: "pending", createdAt: new Date() }, { testing: result.environment === "testing" })
+    if (buyerId) notify(req.app, { recipient: buyerId, type: "delivery_requested", title: "A rider was requested", message: `The seller requested a rider to deliver ${jobTitle}. You will be told when one accepts.`, orderId: result.orderId, data: { orderId: result.orderId } })
     return res.status(201).json(result)
   } catch (e) {
     return res.status(e.code === 11000 ? 409 : e.status || 500).json({ message: e.status ? e.message : e.code === 11000 ? "Delivery already exists." : "Dispatch failed; no rider job committed." })
