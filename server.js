@@ -40,7 +40,8 @@ import promoRoutes from "./routes/promos.js"
 import riderAuthRoutes from "./routes/riderAuth.js"
 import deliveryRoutes from "./routes/deliveries.js"
 import { userNotificationRoutes, riderNotificationRoutes } from "./routes/notifications.js"
-import { riderRoom, ONLINE_RIDERS_ROOM, ONLINE_TEST_RIDERS_ROOM } from "./services/notify.js"
+import { riderRoom, ONLINE_RIDERS_ROOM, ONLINE_TEST_RIDERS_ROOM, registerIo } from "./services/notify.js"
+import { startSettlementSweeper } from "./services/autoSettlement.js"
 import environmentRoutes from "./routes/environment.js"
 import testingPaymentRoutes from "./routes/testingPayments.js"
 
@@ -138,6 +139,8 @@ io.on("connection", socket => {
   })
 })
 app.set("io", io)
+registerIo(io)
+startSettlementSweeper()
 app.set("sellerSockets", sellerSockets)
 app.use(helmet())
 app.use(cors({ origin: allowedOrigins, credentials: true }))
