@@ -5,7 +5,7 @@ import User from "../models/User.js"
 import Listing from "../models/Listing.js"
 import Order from "../models/Order.js"
 import Rider from "../models/Rider.js"
-import { syncRiderOnlineRoom } from "../services/notify.js"
+import { syncRiderOnlineRoom, notify } from "../services/notify.js"
 import Delivery from "../models/Delivery.js"
 import Admin from "../models/Admin.js"
 import Payment from "../models/Payment.js"
@@ -1696,6 +1696,61 @@ router.put(
         message:
           err.message,
       })
+    }
+  }
+)
+
+// Riders waiting for an identity decision (not yet approved, or photo not approved).
+router.get(
+  "/riders/review",
+  requirePermission("manage_riders"),
+  async (req, res) => {
+    try {
+      const riders = await Rider.find({ $or: [{ isApproved: false }, { photoReviewStatus: { $ne: "approved" } }] })
+        .select("name phone email university vehicle isActive isApproved isTestRider photoUrl photoReviewStatus createdAt")
+        .sort({ createdAt: -1 }).limit(100).lean()
+      res.json(riders)
+    } catch (err) {
+      res.status(500).json({ message: err.message })
+    }
+  }
+)
+
+// Identity decision: approve (lets the rider take jobs), reject, or revoke an earlier approval.
+router.put(
+  "/riders/:id/review",
+  requirePermission("manage_riders"),
+  async (req, res) => {
+    try {
+      const decision = req.body?.decision
+      if (!["approve", "reject", "revoke"].includes(decision)) {
+        return res.status(400).json({ message: "decision must be approve, reject or revoke." })
+      }
+      const rider = await Rider.findById(req.params.id)
+      if (!rider) return res.status(404).json({ message: "Rider not found." })
+      if (decision === "approve" && !rider.photoUrl) {
+        return res.status(409).json({ message: "This rider has not uploaded a photo yet." })
+      }
+      if (typeof req.body?.isTestRider === "boolean" && req.body.isTestRider !== !!rider.isTestRider) {
+        if (rider.activeDelivery) return res.status(409).json({ message: "This rider has an active delivery. Finish it before switching test/live mode." })
+        rider.isTestRider = req.body.isTestRider
+      }
+      rider.photoReviewedAt = new Date()
+      if (decision === "approve") { rider.photoReviewStatus = "approved"; rider.isApproved = true }
+      else {
+        rider.photoReviewStatus = decision === "reject" ? "rejected" : "pending"
+        rider.isApproved = false
+        rider.isOnline = false
+      }
+      await rider.save()
+      syncRiderOnlineRoom(req.app, rider._id, rider.isOnline, rider.isTestRider)
+      const stamp = rider.photoReviewedAt.getTime()
+      if (decision === "approve") notify(req.app, { recipient: rider._id, recipientModel: "Rider", type: "rider_approved", title: "You are approved", message: "Your identity was verified. Go online to start receiving delivery jobs.", dedupeKey: `rider_approved:${rider._id}:${stamp}` })
+      if (decision === "reject") notify(req.app, { recipient: rider._id, recipientModel: "Rider", type: "rider_rejected", title: "Identity review needs attention", message: "We could not approve your photo. Please upload a clear, well-lit photo of your face, or contact support.", dedupeKey: `rider_rejected:${rider._id}:${stamp}` })
+      await logAction(req, "rider_identity_reviewed", "rider", rider._id.toString(), { name: rider.name, decision, isTestRider: !!rider.isTestRider })
+      res.json({ message: `${rider.name}: ${decision}d.`.replace("rejectd", "rejected").replace("revoked.", "revoked."), isApproved: rider.isApproved, photoReviewStatus: rider.photoReviewStatus })
+    } catch (err) {
+      res.status(500).json({ message: err.message })
     }
   }
 )
