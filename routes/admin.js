@@ -308,6 +308,53 @@ router.get(
   }
 )
 
+router.get(
+  "/dashboard/trends",
+  async (req, res) => {
+    try {
+      const DAY = 86400000
+      const since = new Date(); since.setHours(0, 0, 0, 0); since.setTime(since.getTime() - 13 * DAY)
+      const day = field => ({ $dateToString: { format: "%Y-%m-%d", date: field } })
+      const live = { createdAt: { $gte: since }, cancelled: { $ne: true } }
+      const [orderDays, signupDays, categories, topSellers, recentOrders, recentUsers, mix] = await Promise.all([
+        Order.aggregate([{ $match: live }, { $group: { _id: day("$createdAt"), orders: { $sum: 1 }, volume: { $sum: "$amount" } } }]),
+        User.aggregate([{ $match: { createdAt: { $gte: since } } }, { $group: { _id: day("$createdAt"), signups: { $sum: 1 } } }]),
+        Listing.aggregate([{ $group: { _id: "$category", count: { $sum: 1 } } }, { $sort: { count: -1 } }, { $limit: 6 }]),
+        Order.aggregate([
+          { $match: { paymentStatus: { $in: ["escrow_held", "release_pending", "released"] } } },
+          { $group: { _id: "$seller", volume: { $sum: "$amount" }, orders: { $sum: 1 } } },
+          { $sort: { volume: -1 } }, { $limit: 5 },
+          { $lookup: { from: "users", localField: "_id", foreignField: "_id", as: "u" } },
+          { $project: { name: { $arrayElemAt: ["$u.name", 0] }, volume: 1, orders: 1 } },
+        ]),
+        Order.find().sort({ createdAt: -1 }).limit(8).populate("listing", "title").select("amount paymentStatus createdAt payerName listing environment").lean(),
+        User.find().sort({ createdAt: -1 }).limit(5).select("name university createdAt").lean(),
+        Order.aggregate([{ $group: { _id: "$paymentStatus", count: { $sum: 1 } } }]),
+      ])
+      const ordersByDay = new Map(orderDays.map(d => [d._id, d])), signupsByDay = new Map(signupDays.map(d => [d._id, d.signups]))
+      const days = Array.from({ length: 14 }, (_, i) => {
+        const d = new Date(since.getTime() + i * DAY), key = d.toISOString().slice(0, 10)
+        const o = ordersByDay.get(key)
+        return { date: key, orders: o?.orders || 0, volume: o?.volume || 0, signups: signupsByDay.get(key) || 0 }
+      })
+      const recent = [
+        ...recentOrders.map(o => ({ type: "order", title: `${o.payerName || "A buyer"} ordered ${o.listing?.title || "an item"}`, detail: `GH\u20B5${Number(o.amount || 0).toLocaleString()} \u00B7 ${o.paymentStatus}${o.environment === "testing" ? " \u00B7 test" : ""}`, at: o.createdAt })),
+        ...recentUsers.map(u => ({ type: "signup", title: `${u.name} joined`, detail: u.university || "", at: u.createdAt })),
+      ].sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, 10)
+      res.json({
+        days,
+        categories: categories.filter(c => c._id).map(c => ({ name: c._id, count: c.count })),
+        topSellers: topSellers.filter(s => s.name).map(s => ({ name: s.name, volume: s.volume, orders: s.orders })),
+        mix: Object.fromEntries(mix.map(m => [m._id || "unknown", m.count])),
+        recent,
+      })
+    } catch (err) {
+      console.error("Admin trends error:", err)
+      res.status(500).json({ message: err.message })
+    }
+  }
+)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // USERS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -514,6 +561,66 @@ router.put(
         message:
           err.message,
       })
+    }
+  }
+)
+
+// Edit a user's basic details (Owner / Super Admin only, always audited).
+router.put(
+  "/users/:id",
+  requireOwnerOrSuperAdmin,
+  async (req, res) => {
+    try {
+      const user = await User.findById(req.params.id)
+      if (!user) return res.status(404).json({ message: "User not found." })
+      const changes = {}
+      for (const field of ["name", "phone", "university"]) {
+        if (req.body?.[field] === undefined) continue
+        const value = String(req.body[field]).trim()
+        if (field === "name" && value.length < 2) return res.status(400).json({ message: "Name must be at least 2 characters." })
+        if (value.length > 120) return res.status(400).json({ message: `${field} is too long.` })
+        if (value !== (user[field] || "")) { changes[field] = { from: user[field] || "", to: value }; user[field] = value }
+      }
+      if (!Object.keys(changes).length) return res.json({ message: "Nothing to change.", user })
+      await user.save()
+      await logAction(req, "user_edited", "user", user._id.toString(), { userEmail: user.email, changes })
+      res.json({ message: `${user.name} updated.`, user })
+    } catch (err) {
+      res.status(500).json({ message: err.message })
+    }
+  }
+)
+
+// Edit a listing's details (Owner / Super Admin only, always audited).
+router.put(
+  "/listings/:id",
+  requireOwnerOrSuperAdmin,
+  async (req, res) => {
+    try {
+      const listing = await Listing.findById(req.params.id)
+      if (!listing) return res.status(404).json({ message: "Listing not found." })
+      const changes = {}
+      const text = { title: 160, desc: 4000, category: 80, condition: 80 }
+      for (const [field, max] of Object.entries(text)) {
+        if (req.body?.[field] === undefined) continue
+        const value = String(req.body[field]).trim()
+        if ((field === "title" || field === "category") && !value) return res.status(400).json({ message: `${field} cannot be empty.` })
+        if (value.length > max) return res.status(400).json({ message: `${field} is too long.` })
+        if (value !== (listing[field] || "")) { changes[field] = { from: listing[field] || "", to: value }; listing[field] = value }
+      }
+      for (const field of ["price", "dailyRate", "maxDays"]) {
+        if (req.body?.[field] === undefined || req.body[field] === "") continue
+        const n = Number(req.body[field])
+        if (!Number.isFinite(n) || n <= 0 || n > 10000000) return res.status(400).json({ message: `${field} must be a positive number.` })
+        if (field === "maxDays" && !Number.isInteger(n)) return res.status(400).json({ message: "maxDays must be a whole number." })
+        if (n !== listing[field]) { changes[field] = { from: listing[field], to: n }; listing[field] = n }
+      }
+      if (!Object.keys(changes).length) return res.json({ message: "Nothing to change.", listing })
+      await listing.save()
+      await logAction(req, "listing_edited", "listing", listing._id.toString(), { title: listing.title, changes })
+      res.json({ message: `"${listing.title}" updated.`, listing })
+    } catch (err) {
+      res.status(500).json({ message: err.message })
     }
   }
 )
